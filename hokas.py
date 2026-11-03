@@ -490,39 +490,51 @@ def find_otp_inputs(sb, timeout=40):
 
 
 def js_fill_code(sb, code):
-    """JS 兜底: 直接在 DOM 里找可见输入框填码, 返回填入的格数"""
+    """JS 填码(主通道): 直接在 DOM 里找验证码输入框填码, 返回 (填入格数, 填后读到的值).
+
+    实测教训(2026-11-04 run 41680849009): HOKAS 的 factor-one 只有一个输入框
+    (autocomplete=one-time-code, inputmode=numeric, maxlength=6, 无 name/id),
+    且该框在视觉上是隐藏的(Clerk 用透明输入框 + 另外画的 6 个数字格),
+    Selenium 的 is_displayed() 会判它不可见, 导致旧逻辑永远找不到它。
+    因此这里不判断可见性, 并用 React 原生 value setter 赋值(普通 el.value=
+    不会触发 React 的 onChange), 再补 input/change 事件。
+    注意: 不用 execute_script 的 arguments 传参(在该浏览器驱动里会报
+    ReferenceError: arguments is not defined), 码值经纯数字校验后直接拼进脚本。
+    """
+    if not (isinstance(code, str) and code.isdigit() and len(code) == 6):
+        log(f"JS 填码: 码值格式异常, 拒绝拼入脚本")
+        return 0, ""
+    script = """
+    function setVal(el, v) {
+        const setter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, v);
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+    const code = "%s";
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const otp = inputs.filter(el =>
+        el.autocomplete === 'one-time-code' || el.inputMode === 'numeric' ||
+        /code|otp/i.test(el.name || '') || /code|otp/i.test(el.id || ''));
+    if (otp.length === 1) {
+        setVal(otp[0], code);
+        return {n: 1, val: otp[0].value};
+    }
+    if (otp.length >= 6) {
+        otp.slice(0, 6).forEach((el, i) => setVal(el, code[i]));
+        return {n: 6, val: otp.slice(0, 6).map(el => el.value).join('')};
+    }
+    return {n: 0, val: ''};
+    """ % code
     try:
-        filled = sb.execute_script(
-            """
-            const code = arguments[0];
-            const inputs = Array.from(document.querySelectorAll('input'))
-                .filter(el => el.offsetWidth || el.offsetHeight);
-            const singles = inputs.filter(el =>
-                el.maxLength === 1 || el.inputMode === 'numeric' ||
-                /code|otp/i.test(el.name || '') || /code|otp/i.test(el.id || ''));
-            let n = 0;
-            if (singles.length >= code.length) {
-                singles.slice(0, code.length).forEach((el, i) => {
-                    el.focus();
-                    el.value = code[i];
-                    el.dispatchEvent(new Event('input', {bubbles: true}));
-                    el.dispatchEvent(new Event('change', {bubbles: true}));
-                    n++;
-                });
-            } else if (inputs.length >= 1) {
-                const el = inputs[0];
-                el.focus();
-                el.value = code;
-                el.dispatchEvent(new Event('input', {bubbles: true}));
-                el.dispatchEvent(new Event('change', {bubbles: true}));
-                n = 1;
-            }
-            return n;
-            """, code)
-        return int(filled or 0)
+        res = sb.execute_script(script)
+        if isinstance(res, dict):
+            return int(res.get("n") or 0), (res.get("val") or "")
+        return 0, ""
     except Exception as e:
         log(f"JS 填码异常: {e}")
-        return 0
+        return 0, ""
 
 
 def otp_value(sb):
@@ -535,18 +547,23 @@ def otp_value(sb):
 
 
 def fill_code(sb, code):
-    """将验证码填入 Clerk 分格输入框: 先试聚焦第一格连续输入, 不生效再逐格填"""
+    """将验证码填入 Clerk 输入框: JS 主通道优先, Selenium 方式兜底.
+
+    HOKAS factor-one 是单个隐藏输入框, Selenium 的可见性判断会漏掉它,
+    所以先走 JS(不判断可见性), 读回的值等于验证码才算成功。
+    """
+    n, val = js_fill_code(sb, code)
+    if n > 0 and val == code:
+        log(f"JS 填码成功(共 {n} 格), 读回值与验证码一致")
+        save_shot(sb, "code_filled")
+        return
+    if n > 0:
+        log(f"JS 填码后读回值不符(读到 {val!r}), 改走 Selenium 方式...")
+    else:
+        log("JS 未找到验证码输入框, 改走 Selenium 方式...")
     els = find_otp_inputs(sb, timeout=40)
     if not els:
-        # 找不到输入框时先把页面 input 结构打进日志, 再用 JS 兜底试一次
         dump_inputs(sb)
-        log("常规选择器未找到输入框, 尝试 JS 兜底填码...")
-        if js_fill_code(sb, code) > 0:
-            sb.sleep(1)
-            if otp_value(sb) == code or len(code) == 6:
-                log("JS 兜底填码已执行")
-                save_shot(sb, "code_filled_js")
-                return
         save_shot(sb, "error_no_otp_input")
         raise RuntimeError(f"未找到验证码输入框, 当前页面: {sb.get_current_url()}")
     log(f"检测到 {len(els)} 个验证码输入框")
@@ -586,21 +603,15 @@ def fill_code(sb, code):
     sb.sleep(1)
 
     if otp_value(sb) != code:
-        # 方式3: JS 直接赋值并触发 input 事件
-        log("逐格填入仍未生效, 尝试 JS 赋值...")
-        els = find_otp_inputs(sb)
-        for i, ch in enumerate(code):
-            if i >= len(els):
-                break
-            try:
-                sb.execute_script(
-                    "arguments[0].value=arguments[1];"
-                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
-                    "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
-                    els[i], ch)
-            except Exception:
-                pass
+        # 方式3: 再走一次 JS 原生 setter(不依赖 arguments 传参, 旧写法会报
+        # ReferenceError), 校验不一致则拒绝提交, 避免用错码去撞登录风控
+        log("逐格填入仍未生效, 再试 JS 原生 setter...")
+        n3, val3 = js_fill_code(sb, code)
         sb.sleep(1)
+        if not (n3 > 0 and val3 == code):
+            save_shot(sb, "error_code_mismatch")
+            raise RuntimeError(
+                "验证码填入后校验不一致, 拒绝提交(避免无效登录尝试触发风控)")
     save_shot(sb, "code_filled")
 
 
@@ -798,9 +809,12 @@ def do_login(sb):
     sb.type(email_input, EMAIL)
     log(f"已输入邮箱: {EMAIL}")
 
-    # 取码通道准备: web 模式下先登录 Gmail 网页版, 并记录当前最新验证码作为基线
+    # 取码通道准备: 只有明确指定 web 模式时才预登录 Gmail 网页版。
+    # 教训(2026-11-04 run 41680849009): auto 模式下预登录 Gmail 网页版
+    # 会被 Google 风控拦截, 且 IMAP 本来就能取到码, 这一步纯属多余风险,
+    # 因此 auto 模式默认只走 IMAP, 网页版仅在 IMAP 失败时由 get_code 兜底。
     gmail_tab, baseline = None, None
-    if CODE_SOURCE == "web" or (CODE_SOURCE == "auto" and GMAIL_PASSWORD):
+    if CODE_SOURCE == "web":
         gmail_tab = gmail_login(sb)
         if gmail_tab:
             main_tab = sb.driver.current_window_handle
