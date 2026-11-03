@@ -929,52 +929,71 @@ def get_remaining(sb):
 
 
 def open_server_overview(sb):
-    """从服务器列表打开目标服务器的 Manage -> Overview"""
-    sb.sleep(2)
+    """确定性导航: 登录后 -> 左侧 My Servers -> 目标服务器卡片 -> Overview.
+    旧版兜底 `a[href*="/server"]` 会误点 Deploy New Server 链接(其 href
+    也含 /server), 导致停在新建服务器页、根本没有 Remaining 可读——
+    2026-11-04 run 41684794037 正是死在这里, 不是续期本身失败。
+    """
     target = SERVER_NAME or "myappas"
+    # 1) 先关 Cookie 横幅, 免得遮挡左侧导航
+    try:
+        if sb.is_element_visible('//button[contains(., "Only necessary")]'):
+            sb.click('//button[contains(., "Only necessary")]')
+            sb.sleep(1)
+    except Exception:
+        pass
+    # 2) 点左侧导航的 My Servers(精确文本), 而不是任何含 server 的链接
+    try:
+        sb.click('//a[normalize-space()="My Servers"]', timeout=10)
+        sb.sleep(3)
+    except Exception as e:
+        save_shot(sb, "error_no_my_servers")
+        raise RuntimeError(f"未能打开 My Servers 列表: {e}")
+    # 3) 在列表里点目标服务器卡片: 链接 href 含 /server 且卡片文本含服务器名
     clicked = False
-    # 1) 按服务器名点击(myappas / SERVER_NAME)
-    for name in dict.fromkeys([n for n in (SERVER_NAME, "myappas") if n]):
+    for sel in (f'//a[contains(@href, "/server") and contains(., "{target}")]',
+                f'//*[contains(text(), "{target}")]/ancestor::a[1]'):
         try:
-            if sb.is_element_visible(f'//*[contains(text(), "{name}")]'):
-                sb.click(f'//*[contains(text(), "{name}")]')
+            if sb.is_element_visible(sel):
+                sb.click(sel)
                 clicked = True
-                log(f"已点击服务器: {name}")
+                log(f"已点击服务器卡片: {target}")
                 break
         except Exception:
             continue
-    # 2) 兜底: 点击第一个服务器卡片/管理链接
-    if not clicked:
-        for sel in ('a[href*="/server"]', 'a[href*="manage"]',
-                    '//a[contains(., "Manage")]',
-                    '//*[text()="My Servers"]/following::a[1]'):
-            try:
-                sb.click(sel, timeout=5)
-                clicked = True
-                log("已点击第一个服务器卡片")
-                break
-            except Exception:
-                continue
     if not clicked:
         save_shot(sb, "error_no_server_card")
-        raise RuntimeError("未找到可点击的服务器卡片")
+        raise RuntimeError(f"My Servers 列表里未找到服务器 {target} 的卡片")
     sb.sleep(5)
-    # 若有 Manage 按钮/标签, 再点进管理页
+    # 4) 若有 Manage 按钮/标签, 再点进管理页
     try:
         if sb.is_element_visible('//a[contains(., "Manage")] | //button[contains(., "Manage")]'):
             sb.click('//a[contains(., "Manage")] | //button[contains(., "Manage")]')
             sb.sleep(4)
     except Exception:
         pass
-    # 确保停在 Overview 标签
+    # 5) 确保停在 Overview 标签
     try:
         if sb.is_element_visible('//*[contains(text(), "Overview")]'):
             sb.click('//*[contains(text(), "Overview")]')
             sb.sleep(3)
     except Exception:
         pass
+    # 6) 校验: 必须是服务器 Overview, 绝不能是 Deploy New Server 页
+    try:
+        page = sb.get_text("body") or ""
+        url = sb.get_current_url()
+    except Exception:
+        page, url = "", ""
+    if "Deploy New Server" in page or "/new" in url:
+        save_shot(sb, "error_wrong_page_deploy")
+        raise RuntimeError(f"导航走偏: 停在了 Deploy New Server 页({url}), "
+                           "未进入服务器 Overview, 拒绝继续读 Remaining")
+    if "Overview" not in page:
+        save_shot(sb, "error_no_overview_tab")
+        raise RuntimeError(f"未进入服务器 Overview 页({url})")
     save_shot(sb, "overview")
-    log(f"服务器 Overview: {sb.get_current_url()} (目标: {target})")
+    log(f"服务器 Overview: {url} (目标: {target})")
 
 
 # ---------------- shrinkme 广告链 ----------------
@@ -1352,14 +1371,17 @@ def main():
                 headless=False, xvfb=True) as sb:
             try:
                 do_login(sb)
-                stage = "renew"
+                stage = "overview"
                 open_server_overview(sb)
+                stage = "renew"
                 main_handle = sb.driver.current_window_handle
 
                 before, before_raw = get_remaining(sb)
                 if before is None:
                     save_shot(sb, "error_no_remaining")
-                    raise RuntimeError("Overview 页未能解析到 Remaining 剩余时间")
+                    raise RuntimeError(
+                        "Overview 页未能解析到 Remaining 剩余时间 "
+                        f"(当前页: {sb.get_current_url()})")
                 log(f"续期前剩余时间: {before} 分钟 ({before_raw})")
                 result_lines.append(f"🕒 续期前剩余: {before_raw or str(before) + ' 分钟'}")
 
@@ -1396,14 +1418,20 @@ def main():
         send_tg("\n".join(result_lines))
         log("任务执行完毕")
         if not credited_any:
-            log("两个 Add 按钮均未到账, 以非 0 退出码结束(便于 Actions 标红排查)")
+            # 注意: 这句话只表示“结束时未确认到账”, 不代表 Add 按钮被执行过;
+            # 死在登录/Overview 阶段时 Add 流程根本未开始, 见上方阶段日志。
+            log("结束时未确认任何 Add 到账(若死在登录/Overview 阶段, "
+                "Add 流程根本未开始), 以非 0 退出码结束(便于 Actions 标红排查)")
             sys.exit(2)
     except SystemExit:
         raise
     except Exception as e:
         if stage == "login":
-            log("登录阶段失败, 本次未能进入续期流程(两个 Add 按钮根本没被执行, "
+            log("登录阶段失败, 本次未能进入续期流程(Add 按钮根本没被执行, "
                 "不是续期本身失败)")
+        elif stage == "overview":
+            log("进入服务器 Overview 阶段失败, Add 流程根本没被执行, "
+                "不是续期本身失败")
         log(f"任务失败: {e}")
         traceback.print_exc()
         result_lines.append(f"❌ 续期失败: {e}")
