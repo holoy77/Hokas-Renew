@@ -1,0 +1,69 @@
+name: Hokas 自动续期
+
+on:
+  schedule:
+    # 每 6 小时执行一次(UTC): 00:15 / 06:15 / 12:15 / 18:15
+    # 与面板上 Add 按钮的 6 小时冷却对齐, 避开整点拥堵
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+
+# 同一时间只跑一个续期任务, 避免重复点击 Add 按钮互相干扰
+concurrency:
+  group: hokas-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xvfb
+          pip install -r requirements.txt
+          pip install seleniumbase
+          seleniumbase install chromedriver || true
+
+      - name: Run renew script
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
+          CODE_SOURCE: ${{ secrets.CODE_SOURCE }}
+          IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
+          IMAP_PORT: ${{ secrets.IMAP_PORT }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+          SIGN_IN_URL: ${{ secrets.SIGN_IN_URL }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+        run: |
+          set -o pipefail
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 hokas.py 2>&1 | tee log.txt
+
+      - name: Upload screenshots (失败排查用)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Job Summary
+        if: always()
+        run: |
+          echo "## Hokas 自动续期运行日志" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat log.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "log.txt 不存在" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "截图见本次运行的 Artifacts: screenshots" >> "$GITHUB_STEP_SUMMARY"
