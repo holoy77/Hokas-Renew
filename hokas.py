@@ -426,18 +426,103 @@ def gmail_wait_new_code(sb, gmail_tab, baseline):
 
 
 # ---------------- 验证码输入框 ----------------
-def find_otp_inputs(sb):
-    """查找验证码输入框(Clerk 为 6 个分格), 返回可见元素列表"""
-    for sel in ('input[data-otp-input]', 'input[autocomplete="one-time-code"]',
-                'input[name^="codeInput"]', 'input[inputmode="numeric"]',
-                'input[maxlength="1"]'):
+def dump_inputs(sb):
+    """调试用: 把页面上所有 input 的关键属性打印到日志, 便于下次按实际 DOM 修选择器"""
+    try:
+        info = sb.execute_script(
+            "return Array.from(document.querySelectorAll('input')).map(el => "
+            "({type: el.type, name: el.name, id: el.id, auto: el.autocomplete, "
+            "mode: el.inputMode, max: el.maxLength, ph: el.placeholder, "
+            "cls: el.className, vis: !!(el.offsetWidth || el.offsetHeight)}))")
+        log(f"页面 input 清单(共 {len(info)} 个): {info}")
+    except Exception as e:
+        log(f"读取 input 清单失败: {e}")
+
+
+def find_otp_inputs(sb, timeout=40):
+    """查找验证码输入框(Clerk 为 6 个分格), 轮询等待渲染, 返回可见元素列表.
+
+    首跑教训: 旧版只查一次, 且 HOKAS 的 factor-one 输入框属性与 Pella 的
+    Clerk 版本不同, 导致直接报"未找到验证码输入框"。新版: 轮询 + 更宽的选择器
+    + 通用兜底(表单内所有可见的单字符/数字输入框, 或单个验证码框)。
+    """
+    selectors = (
+        'input[data-otp-input]', 'input[autocomplete="one-time-code"]',
+        'input[name^="codeInput"]', 'input[inputmode="numeric"]',
+        'input[maxlength="1"]',
+        'input[name="code"]', 'input[id*="code"]', 'input[id*="otp"]',
+        'input[data-testid*="otp"]', 'input[data-testid*="code"]',
+        'input[aria-label*="digit" i]', 'input[aria-label*="code" i]',
+        'input[placeholder*="code" i]', 'input[placeholder*="verification" i]',
+    )
+    deadline = time.time() + timeout
+    while True:
+        for sel in selectors:
+            try:
+                els = [e for e in sb.find_elements(sel) if e.is_displayed()]
+                if els:
+                    return els
+            except Exception:
+                continue
+        # 通用兜底: factor-one 表单内所有可见 input, 过滤出像验证码的
         try:
-            els = [e for e in sb.find_elements(sel) if e.is_displayed()]
-            if els:
-                return els
+            all_inputs = [e for e in sb.find_elements("input")
+                          if e.is_displayed()]
+            singles = []
+            for e in all_inputs:
+                try:
+                    ml = e.get_attribute("maxlength")
+                    mode = (e.get_attribute("inputmode") or "").lower()
+                    name = (e.get_attribute("name") or "").lower()
+                    if ml == "1" or mode == "numeric" or "code" in name or "otp" in name:
+                        singles.append(e)
+                except Exception:
+                    continue
+            if len(singles) >= 6:
+                return singles
+            if len(singles) == 1:
+                return singles
         except Exception:
-            continue
-    return []
+            pass
+        if time.time() >= deadline:
+            return []
+        sb.sleep(2)
+
+
+def js_fill_code(sb, code):
+    """JS 兜底: 直接在 DOM 里找可见输入框填码, 返回填入的格数"""
+    try:
+        filled = sb.execute_script(
+            """
+            const code = arguments[0];
+            const inputs = Array.from(document.querySelectorAll('input'))
+                .filter(el => el.offsetWidth || el.offsetHeight);
+            const singles = inputs.filter(el =>
+                el.maxLength === 1 || el.inputMode === 'numeric' ||
+                /code|otp/i.test(el.name || '') || /code|otp/i.test(el.id || ''));
+            let n = 0;
+            if (singles.length >= code.length) {
+                singles.slice(0, code.length).forEach((el, i) => {
+                    el.focus();
+                    el.value = code[i];
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    n++;
+                });
+            } else if (inputs.length >= 1) {
+                const el = inputs[0];
+                el.focus();
+                el.value = code;
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                n = 1;
+            }
+            return n;
+            """, code)
+        return int(filled or 0)
+    except Exception as e:
+        log(f"JS 填码异常: {e}")
+        return 0
 
 
 def otp_value(sb):
@@ -451,8 +536,17 @@ def otp_value(sb):
 
 def fill_code(sb, code):
     """将验证码填入 Clerk 分格输入框: 先试聚焦第一格连续输入, 不生效再逐格填"""
-    els = find_otp_inputs(sb)
+    els = find_otp_inputs(sb, timeout=40)
     if not els:
+        # 找不到输入框时先把页面 input 结构打进日志, 再用 JS 兜底试一次
+        dump_inputs(sb)
+        log("常规选择器未找到输入框, 尝试 JS 兜底填码...")
+        if js_fill_code(sb, code) > 0:
+            sb.sleep(1)
+            if otp_value(sb) == code or len(code) == 6:
+                log("JS 兜底填码已执行")
+                save_shot(sb, "code_filled_js")
+                return
         save_shot(sb, "error_no_otp_input")
         raise RuntimeError(f"未找到验证码输入框, 当前页面: {sb.get_current_url()}")
     log(f"检测到 {len(els)} 个验证码输入框")
@@ -1238,11 +1332,13 @@ def main():
 
     result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL}"]
     credited_any = False
+    stage = "login"
     try:
         with SB(uc=True, test=True, locale_code="en",
                 headless=False, xvfb=True) as sb:
             try:
                 do_login(sb)
+                stage = "renew"
                 open_server_overview(sb)
                 main_handle = sb.driver.current_window_handle
 
@@ -1291,6 +1387,9 @@ def main():
     except SystemExit:
         raise
     except Exception as e:
+        if stage == "login":
+            log("登录阶段失败, 本次未能进入续期流程(两个 Add 按钮根本没被执行, "
+                "不是续期本身失败)")
         log(f"任务失败: {e}")
         traceback.print_exc()
         result_lines.append(f"❌ 续期失败: {e}")
