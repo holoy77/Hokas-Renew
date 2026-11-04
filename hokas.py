@@ -1621,9 +1621,11 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     # --- 第 1 步: 验证页 ---
     # 过验证码 -> 点 Continue -> 确认页面真的离开了验证页。
     # 若点完仍停留在验证页(仍有 check the captcha 提示), 说明验证码
-    # 没真正通过, 回炉重来, 最多 3 轮, 避免在验证页上白等 Get Link。
+    # 没真正通过, 回炉重来。Deborah 2026-11-04 要求: 起码试 7/8/9/10 轮，
+    # 因此这里定为最多 10 轮(之前是 3 轮封顶，run 41781863944 就是
+    # 死在这个上限上；600 秒预算版约 6 轮，不够她要的轮数)。
     advanced = False
-    for cycle in range(1, 4):
+    for cycle in range(1, 11):
         if not pass_turnstile(sb, flow_handle, main_handle, tag):
             return False
         ok = click_and_settle(
@@ -1650,7 +1652,7 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             break
         log(f"[{tag}] 第 {cycle} 轮 Continue 后仍停留在验证页, 回炉重过验证码...")
     if not advanced:
-        log(f"[{tag}] 多轮后仍未离开验证页, 验证码未真正通过")
+        log(f"[{tag}] 第 1 步 10 轮后仍未离开验证页, 验证码未真正通过")
         return False
 
     # --- 第 2 步: 中间博客页 STEP 1 OF 2 -> CLICK TO VERIFY ---
