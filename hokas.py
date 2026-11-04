@@ -145,6 +145,23 @@ def _stop_xray():
         pass
 
 
+def _print_xray_tail():
+    """把 Xray 运行时日志的末尾打进跑日志(诊断用)。
+    教训(2026-11-04 run 41800585122): 浏览器“连接被重置”时, 真正的
+    原因(握手失败/UDP 不通/节点拒绝)只写在 Xray 的日志里, 而它之前
+    没进跑的产物、跑完就丢了, 导致只能看到症状、看不到原因。
+    只在文件存在且非空时打印, 长度截断; Xray 日志不含配置密码,
+    只有地址和报错, 可安全进日志。任何异常都静默, 绝不因此坏了主流程。"""
+    try:
+        if not os.path.isfile("/tmp/xray-error.log"):
+            return
+        tail = open("/tmp/xray-error.log", errors="replace").read()[-3000:]
+        if tail.strip():
+            log(f"Xray 运行时日志(末尾):\n{tail.strip()}")
+    except Exception:
+        pass
+
+
 def parse_vless_uri(uri):
     """解析 vless://UUID@HOST:PORT?params, 返回节点 dict。
     调用方绝不能把原始 URI 或 UUID 打进日志。"""
@@ -323,8 +340,10 @@ def build_xray_config_hysteria2(node):
         stream["finalmask"] = {
             "udp": [{"type": "salamander",
                      "settings": {"password": node["obfs_password"]}}]}
+    # 诊断用: hy2 的日志级别暂为 info(多记连接尝试, 便于定位“连接被
+    # 重置”到底是握手失败、UDP 不通还是节点拒绝); 定位清楚后可改回 warning。
     return {
-        "log": {"loglevel": "warning"},
+        "log": {"loglevel": "info"},
         "inbounds": [
             {"port": 1080, "listen": "127.0.0.1", "protocol": "socks",
              "settings": {"auth": "noauth", "udp": True}},
@@ -2591,6 +2610,7 @@ def main():
         result_lines.append(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         send_tg("\n".join(result_lines))
         log("任务执行完毕")
+        _print_xray_tail()
         if not credited_any:
             # 注意: 这句话只表示“结束时未确认到账”, 不代表 Add 按钮被执行过;
             # 死在登录/Overview 阶段时 Add 流程根本未开始, 见上方阶段日志。
@@ -2609,6 +2629,7 @@ def main():
             log("进入服务器 Overview 阶段失败, Add 流程根本没被执行, "
                 "不是续期本身失败")
         log(f"任务失败: {e}")
+        _print_xray_tail()
         traceback.print_exc()
         result_lines.append(f"❌ 续期失败: {e}")
         send_tg("\n".join(result_lines))
