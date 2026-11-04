@@ -1352,6 +1352,40 @@ def _js_click_by_text(sb, text):
         return f"js-error: {e}"
 
 
+def _js_text_visible(sb, text):
+    """用 JS 判断精确文本是否存在(穿透 shadow DOM, 容忍空白符差异)。
+    只做存在性判断, 不点击, 供 Get Link 等待循环兜底。"""
+    lit = json.dumps(text)
+    lit_up = json.dumps(text.upper())
+    js = (
+        "var found = false;"
+        "function walk(root) {"
+        "  if (found) { return; }"
+        "  var els = root.querySelectorAll('*');"
+        "  for (var i = 0; i < els.length; i++) {"
+        "    var el = els[i];"
+        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
+        "    var t = (el.innerText || el.textContent || '').trim();"
+        "    if (t === " + lit + " || t.toUpperCase() === " + lit_up + ") {"
+        "      found = true; return;"
+        "    }"
+        "  }"
+        "}"
+        "var docs = [document];"
+        "var frs = document.querySelectorAll('iframe');"
+        "for (var k = 0; k < frs.length; k++) {"
+        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
+        "  catch (e) {}"
+        "}"
+        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
+        "return found;"
+    )
+    try:
+        return bool(sb.execute_script(js))
+    except Exception:
+        return False
+
+
 def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3,
                      button_text=None):
     """
@@ -1537,6 +1571,46 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     else:
         log(f"[{tag}] 未出现 STEP 中间页, 直接进入第 3 步(当前: {sb.get_current_url()})")
 
+    # --- 第 2.5 步: 点完验证后 STEP 页会变成 "To scroll down, click Continue..." ---
+    # 必须把文章页滚到底再点 Continue..., 否则永远停在 STEP 1 OF 2,
+    # 第 3 步等 Get Link 只是白等 120 秒(run 41763090685 的截图证明了这点)。
+    if is_step_page:
+        try:
+            scroll_hint = sb.is_text_visible("To scroll down, click Continue")
+        except Exception:
+            scroll_hint = False
+        if scroll_hint:
+            log(f"[{tag}] 出现滚到底提示, 正在分段滚动页面...")
+            focus_window(sb, flow_handle)
+            try:
+                # 懒加载页面滚到底后高度还会变, 每步重读高度, 直到滚不动为止
+                y = 0
+                for _ in range(60):
+                    h = sb.execute_script("return document.body.scrollHeight") or 0
+                    if y >= h:
+                        break
+                    sb.execute_script(f"window.scrollTo(0, {y})")
+                    y += 500
+                    sb.sleep(1)
+                sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception as e:
+                log(f"[{tag}] 滚动异常: {e}")
+            sb.sleep(3)
+            ok2 = click_and_settle(
+                sb,
+                ['//button[contains(., "Continue")]',
+                 '//a[contains(., "Continue")]',
+                 '//*[normalize-space()="Continue..."]',
+                 '//input[contains(@value, "Continue")]'],
+                flow_handle, main_handle, f"{tag}_step2_scroll_continue",
+                button_text="Continue...")
+            save_shot(sb, f"{tag}_after_scroll_continue")
+            if not ok2:
+                log(f"[{tag}] 滚到底后 Continue... 点击失败")
+                return False
+            log(f"[{tag}] 已点 Continue..., 等待进入倒计时页")
+            sb.sleep(3)
+
     # --- 第 3 步: YOUR LINK IS ALMOST READY -> 倒计时 -> Get Link ---
     focus_window(sb, flow_handle)
     deadline = time.time() + 120
@@ -1545,6 +1619,7 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                     '//*[normalize-space()="Get Link"] | '
                     '//input[contains(@value, "Get Link")]')
     ready = False
+    waited = 0
     while time.time() < deadline:
         close_extra_windows(sb, {flow_handle, main_handle})
         focus_window(sb, flow_handle)
@@ -1561,9 +1636,21 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                 log(f"[{tag}] Get Link 已出现但暂不可点(倒计时中)...")
             elif sb.is_text_visible("YOUR LINK IS ALMOST READY"):
                 log(f"[{tag}] 倒计时进行中...")
+            elif _js_text_visible(sb, "Get Link"):
+                # XPath 未命中但 JS 检出: 文本空白符差异, 点 Get Link 环节有 JS 兜底
+                log(f"[{tag}] Get Link 已出现(JS 检出, XPath 未命中)...")
+                ready = True
+                break
         except Exception:
             pass
         sb.sleep(5)
+        waited += 5
+        if waited % 30 == 0:
+            # 每 30 秒留一条进度, 免得下次看日志只剩空白
+            try:
+                log(f"[{tag}] 等 Get Link 中({waited}s, 当前: {sb.get_current_url()})")
+            except Exception:
+                pass
     save_shot(sb, f"{tag}_getlink_page")
     if not ready:
         log(f"[{tag}] Get Link 在时限内未变为可点击")
@@ -1601,6 +1688,48 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     return False
 
 
+def _js_find_by_text(sb, text):
+    """用 JS 按渲染文本找元素, 返回 WebElement 或 None。
+    穿透 shadow DOM, 容忍空白符差异(innerText 归一化)。
+    execute_script 可以直接返回 DOM 元素, 调用方用 WebDriver 原生点击
+    (可信点击, 比 JS el.click() 更不容易被页面忽略)。
+    CLICK TO VERIFY 就是靠这招才找到的, Add 按钮同理兜底。"""
+    lit = json.dumps(text)
+    lit_up = json.dumps(text.upper())
+    js = (
+        "var out = [], outCi = [];"
+        "function walk(root) {"
+        "  var els = root.querySelectorAll('*');"
+        "  for (var i = 0; i < els.length; i++) {"
+        "    var el = els[i];"
+        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
+        "    var t = (el.innerText || el.textContent || '').trim();"
+        "    if (t === " + lit + ") { out.push(el); }"
+        "    else if (t.toUpperCase() === " + lit_up + ") { outCi.push(el); }"
+        "  }"
+        "}"
+        "var docs = [document];"
+        "var frs = document.querySelectorAll('iframe');"
+        "for (var k = 0; k < frs.length; k++) {"
+        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
+        "  catch (e) {}"
+        "}"
+        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
+        "var cands = out.length > 0 ? out : outCi;"
+        "if (cands.length === 0) { return null; }"
+        "for (var j = 0; j < cands.length; j++) {"
+        "  if (['BUTTON', 'A', 'INPUT'].indexOf(cands[j].tagName) >= 0) {"
+        "    return cands[j];"
+        "  }"
+        "}"
+        "return cands[cands.length - 1];"
+    )
+    try:
+        return sb.execute_script(js)
+    except Exception:
+        return None
+
+
 def find_add_button(sb, hours):
     """在 Overview 页找 Add XX Hours 按钮, 返回 (xpath, 元素或None)。
     放宽两点(run 41754237293 里 Add 12 明明可见却没找到):
@@ -1628,6 +1757,19 @@ def find_add_button(sb, hours):
             except Exception:
                 continue
         sb.sleep(3)
+    # XPath 全军覆没时用 JS 渲染文本找: 面板按钮也可能有空白符/Shadow 问题,
+    # Add 12 在多个运行里明明可见却找不到, 不能再带着这个已知问题跑。
+    try:
+        el = _js_find_by_text(sb, f"Add {hours} Hours")
+        if el is not None:
+            try:
+                if el.is_displayed():
+                    log(f"[Add {hours} Hours] JS 兜底找到按钮")
+                    return "JS", el
+            except Exception:
+                pass
+    except Exception:
+        pass
     return xpaths[0], None
 
 
