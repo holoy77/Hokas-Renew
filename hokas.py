@@ -2112,68 +2112,46 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
         return False
 
     # --- 阶段 4: 首页面倒计时 -> Get Link ---
-    get_link_sel = '//button[normalize-space()="Get Link"]'
-    deadline = time.time() + 90
-    ready = False
-    while time.time() < deadline:
+    # 教训(run 41811223572): 倒计时页截图明明显示 0 秒+绿色 Get Link,
+    # 旧逻辑(只认 <button> + Selenium is_visible/is_clickable)却 90 秒
+    # 都没见它可点。原因同 Start/Add-12 一家: Selenium 的可见/可用
+    # 判定在这类页上会漏掉明明存在的元素(且 Get Link 也可能根本不是
+    # <button> 而是 <a>)。改成原子 JS 轮询: 一次调用内找+点(不跨
+    # 边界传元素, 免 stale), 点上后扫一遍窗口看是否跳回 hokas, 90 秒
+    # 内没跳回才失败。
+    _getlink_deadline = time.time() + 90
+    _getlink_clicked = False
+    while time.time() < _getlink_deadline:
         settle_popups()
         if on_hokas():
             return True
-        try:
-            if sb.is_element_visible(get_link_sel):
-                els = sb.find_elements(get_link_sel, by="xpath")
-                if any(is_clickable(e) for e in els):
-                    ready = True
-                    break
-                log(f"[{tag}] Get Link 已出现但暂不可点(倒计时中)...")
-            elif sb.is_text_visible("YOUR LINK IS ALMOST READY"):
-                log(f"[{tag}] 首页面倒计时进行中...")
-            else:
-                log(f"[{tag}] 首页面倒计时页状态不明, 当前: {sb.get_current_url()}")
-                break
-        except Exception:
-            pass
-        sb.sleep(5)
-    if not ready:
-        log(f"[{tag}] 倒计时 90 秒仍未见可点 Get Link")
-        save_shot(sb, f"{tag}_getlink_not_ready")
-        return False
-    # 点 Get Link: popunder 会吞掉点击, 点完关广告回主窗口重点, 直到跳回 hokas
-    for attempt in range(1, 5):
         focus_window(sb, flow_handle)
         try:
-            url_before = sb.get_current_url() or ""
-        except Exception:
-            url_before = ""
-        try:
-            sb.click(get_link_sel)
-            try:
-                url_after = sb.get_current_url() or ""
-            except Exception:
-                url_after = ""
-            log(f"[{tag}] 第 {attempt} 次点击 Get Link (点击前: {url_before} -> 点击后: {url_after})")
+            _gl = _js_click_text_atomic(sb, "Get Link")
         except Exception as e:
-            log(f"[{tag}] 点击 Get Link 异常: {e}")
-            _click_overlay_button(sb, flow_handle, main_handle,
-                                  "Get Link", f"{tag}_getlink_js")
-        sb.sleep(5)
-        for h in list(sb.driver.window_handles):
+            _gl = f"异常: {e}"
+        log(f"[{tag}] Get Link 原子点: {_gl}")
+        if isinstance(_gl, str) and _gl.startswith("clicked"):
+            _getlink_clicked = True
+            sb.sleep(5)
+            for h in list(sb.driver.window_handles):
+                try:
+                    sb.driver.switch_to.window(h)
+                    if "hokas.net" in sb.get_current_url():
+                        log(f"[{tag}] Get Link 成功, 已回到 hokas.net: {sb.get_current_url()}")
+                        save_shot(sb, f"{tag}_back_on_hokas")
+                        return True
+                except Exception:
+                    continue
+            close_extra_windows(sb, {flow_handle, main_handle})
+            focus_window(sb, flow_handle)
             try:
-                sb.driver.switch_to.window(h)
                 if "hokas.net" in sb.get_current_url():
-                    log(f"[{tag}] Get Link 成功, 已回到 hokas.net: {sb.get_current_url()}")
-                    save_shot(sb, f"{tag}_back_on_hokas")
                     return True
             except Exception:
-                continue
-        close_extra_windows(sb, {flow_handle, main_handle})
-        focus_window(sb, flow_handle)
-        try:
-            if "hokas.net" in sb.get_current_url():
-                return True
-        except Exception:
-            pass
-    log(f"[{tag}] Get Link 多次点击后仍未跳回 hokas.net")
+                pass
+        sb.sleep(5)
+    log(f"[{tag}] Get Link 90 秒仍未跳回 hokas.net(点上过: {_getlink_clicked})")
     save_shot(sb, f"{tag}_getlink_failed")
     return False
 
@@ -2582,6 +2560,94 @@ def _js_dump_start_candidates(sb):
         return ""
 
 
+def _js_click_text_atomic(sb, text):
+    """原子 JS 找+点(精确文本): 一次 JS 调用内按归一化精确文本找到
+    可见可用的控件并立即点它, 返回状态字符串(不跨 Python/JS 边界
+    传元素, 免去页面重渲染造成的 stale)。<button> 优先, 再任意叶
+    元素(含 <a>; 调用方保证精确文本在本页无歧义, 如 Get Link 页)。
+    用于 Get Link(旧逻辑只认 <button> + Selenium 可见判定, 实测
+    截图明明有绿色 Get Link 却 90 秒没见它可点)。"""
+    lit = json.dumps(text)
+    js = (
+        "var norm = function(s){ return (s || '').replace(/\\u00a0/g, ' ')"
+        "  .replace(/\\u2026|\\u2025/g, '...').replace(/\\s+/g, ' ').trim(); };"
+        "var target = " + lit + ";"
+        "function visible(el){ var r = el.getBoundingClientRect();"
+        "  return r.width > 0 && r.height > 0; }"
+        "var btns = document.querySelectorAll('button');"
+        "for (var i = 0; i < btns.length; i++) {"
+        "  if (norm(btns[i].innerText || btns[i].textContent) === target"
+        "      && visible(btns[i]) && !btns[i].disabled) {"
+        "    btns[i].click(); return 'clicked-button'; }"
+        "}"
+        "var all = document.querySelectorAll('*');"
+        "var best = null, bestLen = 1e9;"
+        "for (var j = 0; j < all.length; j++) {"
+        "  var el = all[j];"
+        "  var t = norm(el.innerText || el.textContent);"
+        "  if (t !== target) { continue; }"
+        "  if (!visible(el) || el.disabled) { continue; }"
+        "  var has = false;"
+        "  for (var k = 0; k < el.children.length; k++) {"
+        "    if (norm(el.children[k].innerText || el.children[k].textContent) === target) { has = true; break; }"
+        "  }"
+        "  if (has) { continue; }"
+        "  if (t.length < bestLen) { best = el; bestLen = t.length; }"
+        "}"
+        "if (best) { best.click(); return 'clicked-leaf'; }"
+        "return 'not-found';"
+    )
+    try:
+        return sb.execute_script(js) or "not-found"
+    except Exception as e:
+        return f"异常: {e}"
+
+
+def _js_click_start_atomic(sb):
+    """原子 JS 找+点 Start: 一次 JS 调用内找到可见可用的 Start 并立即
+    点它, 返回 'clicked|<text>' 或 'not-found'(字符串, 免 stale)。
+    教训(run 41811223572): dump 明明证明 BUTTON|Start 存在且
+    disabled=false、矩形 93x42, 但先找元素再跨边界点的老路 60 秒
+    都没捞到——页面每秒重渲染, 跨边界传的元素到手就 stale。
+    找法: <button>/<a>/[role=button] 中文本含 Start(不含 Restart)、
+    可见、未禁用者优先; 再任意叶元素(文本含 Start、不含 Restart、
+    可见、未禁用、最短文本优先)。"""
+    js = (
+        "function norm(s){ return (s || '').replace(/\\u00a0/g, ' ')"
+        "  .replace(/\\s+/g, ' ').trim(); }"
+        "function visible(el){ var r = el.getBoundingClientRect();"
+        "  return r.width > 0 && r.height > 0; }"
+        "var els = document.querySelectorAll('button, a, [role=\"button\"]');"
+        "for (var i = 0; i < els.length; i++) {"
+        "  var t = norm(els[i].innerText || els[i].textContent);"
+        "  if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1"
+        "      && visible(els[i]) && !els[i].disabled) {"
+        "    els[i].click(); return 'clicked|' + t; }"
+        "}"
+        "var all = document.querySelectorAll('*');"
+        "var best = null, bestLen = 1e9, bestText = '';"
+        "for (var j = 0; j < all.length; j++) {"
+        "  var el = all[j];"
+        "  var tt = norm(el.innerText || el.textContent);"
+        "  if (tt.indexOf('Start') === -1 || tt.indexOf('Restart') !== -1) { continue; }"
+        "  if (!visible(el) || el.disabled) { continue; }"
+        "  var has = false;"
+        "  for (var k = 0; k < el.children.length; k++) {"
+        "    var ct = norm(el.children[k].innerText || el.children[k].textContent);"
+        "    if (ct.indexOf('Start') !== -1 && ct.indexOf('Restart') === -1) { has = true; break; }"
+        "  }"
+        "  if (has) { continue; }"
+        "  if (tt.length < bestLen) { best = el; bestLen = tt.length; bestText = tt; }"
+        "}"
+        "if (best) { best.click(); return 'clicked|' + bestText; }"
+        "return 'not-found';"
+    )
+    try:
+        return sb.execute_script(js) or "not-found"
+    except Exception as e:
+        return f"异常: {e}"
+
+
 def ensure_started(sb):
     """过期服务器加时长后仍是 Stopped, 必须点 Start 才能真正上线。
     (Deborah 2026-11-04 指出: 页面有 Start 按钮, 加完时长直接启动。
@@ -2595,41 +2661,22 @@ def ensure_started(sb):
     if remaining is not None and remaining <= 0:
         log("[Start] 剩余时间为 0, 无时长可启动, 跳过 Start")
         return "no_time"
-    # 找 Start 按钮: 先 XPath(精确/含文本), 再旧 JS 兜底, 再 JS 新鲜
-    # 查找(抗 stale, 且覆盖非 <button> 元素)。每秒重渲染会让取到的
-    # 元素 stale, 且按钮可能在导航回来后过一阵才变可用, 因此最多等
-    # 60 秒(每轮 fresh 查询), 找到可用按钮立刻停, 而不是 3 轮快查
-    # 就放弃(教训 run 41810242412: 按钮明明在 DOM 里却没捞到)。
-    start_el = None
+    # 点 Start: 原子 JS 找+点(一次 JS 调用内找并立即点, 不跨边界传
+    # 元素)。教训(run 41811223572): 页面每秒重渲染, 老路先找元素再
+    # 点, 60 秒都没捞到明明存在且可用的 BUTTON|Start。最多轮询 60 秒,
+    # 点上立刻进 Running 等待; 60 秒都没点上才走 no_button 诊断。
+    _start_clicked_text = None
     _start_deadline = time.time() + 60
-    while time.time() < _start_deadline and start_el is None:
-        for xpath in ['//button[normalize-space()="Start"]',
-                      '//button[contains(., "Start") and not(contains(., "Restart"))]']:
-            try:
-                for e in sb.find_elements(xpath, by="xpath"):
-                    try:
-                        if e.is_enabled():
-                            start_el = e
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                continue
-            if start_el is not None:
-                break
-        if start_el is None:
-            try:
-                el = _js_find_by_text(sb, "Start")
-                if el is not None:
-                    start_el = el
-            except Exception:
-                pass
-        if start_el is None:
-            start_el = _js_find_start_button(sb)
-        if start_el is not None:
+    while time.time() < _start_deadline and _start_clicked_text is None:
+        try:
+            _st = _js_click_start_atomic(sb)
+        except Exception as e:
+            _st = f"异常: {e}"
+        if isinstance(_st, str) and _st.startswith("clicked"):
+            _start_clicked_text = _st.split("|", 1)[1] if "|" in _st else ""
             break
         sb.sleep(2)
-    if start_el is None:
+    if _start_clicked_text is None:
         # 没有可点的 Start 按钮: 可能已在运行(Start 被禁用/消失)
         try:
             if sb.is_text_visible("Running") or sb.is_text_visible("RUNNING"):
@@ -2644,32 +2691,10 @@ def ensure_started(sb):
             log("[Start] 未找到可点的 Start 按钮")
         return "no_button"
     try:
-        btn_text = (start_el.text or "").strip()
-    except Exception:
-        btn_text = ""
-    _clicked = False
-    try:
-        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", start_el)
-        sb.sleep(1)
-        start_el.click()
-        _clicked = True
-    except Exception as e:
-        log(f"[Start] 正常点击失败({e}), JS 新鲜查找一次并 JS 点击...")
-        try:
-            fresh = _js_find_start_button(sb)
-            if fresh is not None:
-                sb.execute_script("arguments[0].click();", fresh)
-                _clicked = True
-        except Exception as e2:
-            log(f"[Start] JS 点击也失败: {e2}")
-    if not _clicked:
-        log("[Start] 点击 Start 失败")
-        return "start_failed"
-    try:
         cur_u = sb.get_current_url() or ""
     except Exception:
         cur_u = ""
-    log(f"[Start] 已点击 Start 按钮[{btn_text}] (点击时 URL: {cur_u}), 等待启动...")
+    log(f"[Start] 已点击 Start 按钮[{_start_clicked_text}] (点击时 URL: {cur_u}), 等待启动...")
     # 启动需要时间: 最多等 60 秒, 看到 Running 即成功
     deadline = time.time() + 60
     while time.time() < deadline:
