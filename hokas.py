@@ -1164,23 +1164,69 @@ def open_server_overview(sb):
         save_shot(sb, "error_no_server_card")
         raise RuntimeError(f"My Servers 列表里未找到服务器 {target} 的卡片")
     sb.sleep(5)
-    # 4) 若有 Manage 按钮/标签, 再点进管理页
-    try:
-        if sb.is_element_visible('//a[contains(., "Manage")] | //button[contains(., "Manage")]'):
-            sb.click('//a[contains(., "Manage")] | //button[contains(., "Manage")]')
-            sb.sleep(4)
-    except Exception:
-        pass
-    # 5) 确保停在 Overview 标签(优先点链接/标签形态的 Overview)
-    try:
-        if sb.is_element_visible('//a[contains(., "Overview")]'):
-            sb.click('//a[contains(., "Overview")]')
-            sb.sleep(3)
-        elif sb.is_element_visible('//*[contains(text(), "Overview")]'):
-            sb.click('//*[contains(text(), "Overview")]')
-            sb.sleep(3)
-    except Exception:
-        pass
+    # Overview 判定: 面包屑含 "> Overview" 或出现 SERVER EXPIRING 面板。
+    # 注意不能只看 body 含 "Overview"——Manage 页的侧栏里也有 Overview 链接。
+    def _on_overview_tab():
+        try:
+            if sb.is_text_visible("SERVER EXPIRING"):
+                return True
+        except Exception:
+            pass
+        try:
+            body = sb.get_text("body") or ""
+            # 面包屑形如 Dashboard > My Servers > jaosonserver > Overview
+            if "> Overview" in body:
+                return True
+        except Exception:
+            pass
+        return False
+    # 4) 若已在 Overview, 跳过 Manage 点击: 卡片点击可能已直接落在 Overview,
+    # 再点一次 Manage 反而切走, 回切纯属多余风险(run 41768508462 的教训)。
+    if _on_overview_tab():
+        log("已在 Overview 标签, 跳过 Manage 点击")
+    else:
+        # 若有 Manage 按钮/标签, 再点进管理页, 然后等侧栏渲染出来
+        # (Manage 页加载慢时立即点 Overview 会丢点击)。
+        try:
+            if sb.is_element_visible('//a[contains(., "Manage")] | //button[contains(., "Manage")]'):
+                sb.click('//a[contains(., "Manage")] | //button[contains(., "Manage")]')
+        except Exception as e:
+            log(f"点 Manage 标签异常(继续): {e}")
+        for _ in range(8):
+            try:
+                if sb.is_element_visible('//a[normalize-space()="Overview"]'):
+                    break
+            except Exception:
+                pass
+            sb.sleep(2)
+    # 5) 确保停在 Overview 标签, 且必须验证成功才算数。
+    # 点一次没切过去就重试, 绝不能像以前那样吞掉异常继续往下读 Remaining。
+    # 点标签时优先精确文本, 避免含糊的 contains 误点别的链接。
+    overview_ok = False
+    for attempt in range(1, 4):
+        if _on_overview_tab():
+            overview_ok = True
+            break
+        try:
+            if sb.is_element_visible('//a[normalize-space()="Overview"]'):
+                sb.click('//a[normalize-space()="Overview"]')
+            elif sb.is_element_visible('//a[contains(., "Overview")]'):
+                sb.click('//a[contains(., "Overview")]')
+            elif sb.is_element_visible('//*[contains(text(), "Overview")]'):
+                sb.click('//*[contains(text(), "Overview")]')
+            else:
+                log(f"第 {attempt} 次: 未找到 Overview 标签")
+        except Exception as e:
+            log(f"第 {attempt} 次点 Overview 标签异常: {e}")
+        sb.sleep(4)
+    if not overview_ok and not _on_overview_tab():
+        try:
+            cur = sb.get_current_url()
+        except Exception:
+            cur = ""
+        save_shot(sb, "error_not_on_overview_tab")
+        raise RuntimeError(f"多次点击 Overview 标签后仍未切到 Overview(当前: {cur}), "
+                           "拒绝在错误标签页上读 Remaining")
     # 6) 校验: 必须是服务器 Overview, 绝不能是 Deploy New Server 页。
     # 注意: 绝不能用整页 body 文本判 "Deploy New Server"——左侧导航栏
     # 在每一页都含有这几个字, 那样连正确的 Overview 页也会被误判走偏。
