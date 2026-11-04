@@ -1300,56 +1300,62 @@ def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3):
     return clicked_any
 
 
-def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=150):
-    """
-    处理 shrinkme 验证页的 Cloudflare Turnstile 勾选框:
-    UC 模式下用 uc_gui_click_captcha 点选, 然后耐心等待页面放行;
-    已知该验证可能 "验证中 -> 重置", 做多轮重试。全程以截图取证。
-    放行判据: 出现 "Click here to continue" 可点击, 或验证框消失。
-    """
-    deadline = time.time() + timeout
-    round_no = 0
-    while time.time() < deadline:
-        round_no += 1
-        if not focus_window(sb, flow_handle):
+def _captcha_gone(sb):
+    """验证页是否已不在: 无 'check the captcha' 提示, 且无 Cloudflare 框。
+    注意: 父页面读不到跨域 iframe 里的勾选状态, 所以这只能判“框消失”,
+    不能判“已勾选通过”——真正的放行只能由 Continue 点击后的页面推进来验证。"""
+    try:
+        if sb.is_text_visible("Please check the captcha"):
             return False
-        # 已放行?
+    except Exception:
+        pass
+    try:
+        if sb.is_element_present('iframe[src*="challenges.cloudflare.com"]'):
+            return False
+        if sb.is_element_present('iframe[title*="Cloudflare"]'):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=60):
+    """
+    对验证页做一轮“点验证码框 + 等验证”:
+    - 若验证码框已消失, 直接算过;
+    - 否则点一次框, 等最多 timeout 秒看框是否消失;
+    - 即使框还在, 也返回 True 让调用方去点 Continue, 由页面是否推进
+      来最终判定(框可能通过后仍显示, 死等它消失会误杀)。
+    关键教训(run 41754237293): “Click here to continue”按钮在验证页上
+    一直可见, 它出现≠验证通过。旧版一见 Continue 就判放行, 结果
+    Continue 点完仍停留在验证页, 后续白白等了 120 秒 Get Link。
+    返回 False 只表示窗口丢失或点框异常, 不代表验证一定没过。
+    """
+    if not focus_window(sb, flow_handle):
+        return False
+    if _captcha_gone(sb):
+        log(f"[{tag}] 验证码框已不在, 视为已通过")
+        return True
+    try:
+        log(f"[{tag}] 尝试点击 Turnstile 验证框...")
+        sb.uc_gui_click_captcha()
+    except Exception as e:
+        log(f"[{tag}] uc_gui_click_captcha 异常: {e}")
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sb.sleep(5)
+        close_extra_windows(sb, {flow_handle, main_handle})
+        focus_window(sb, flow_handle)
         try:
-            if sb.is_element_visible(
-                    '//button[contains(., "Click here to continue")] | '
-                    '//a[contains(., "Click here to continue")]'):
-                log(f"[{tag}] Turnstile 已放行(Continue 按钮出现)")
+            if _captcha_gone(sb):
+                log(f"[{tag}] 验证码框已消失")
+                save_shot(sb, f"{tag}_turnstile_passed")
                 return True
         except Exception:
             pass
-        try:
-            log(f"[{tag}] 第 {round_no} 轮: 尝试点击 Turnstile 验证框...")
-            sb.uc_gui_click_captcha()
-        except Exception as e:
-            log(f"[{tag}] uc_gui_click_captcha 异常(可忽略): {e}")
-        # 耐心等待: 每 5 秒看一次是否放行, 最多等 45 秒再进入下一轮
-        for _ in range(9):
-            sb.sleep(5)
-            close_extra_windows(sb, {flow_handle, main_handle})
-            focus_window(sb, flow_handle)
-            try:
-                if sb.is_element_visible(
-                        '//button[contains(., "Click here to continue")] | '
-                        '//a[contains(., "Click here to continue")]'):
-                    log(f"[{tag}] Turnstile 已放行")
-                    save_shot(sb, f"{tag}_turnstile_passed")
-                    return True
-                # 验证框彻底消失也视为放行
-                if not sb.is_element_present('iframe[src*="challenges.cloudflare.com"]') \
-                        and not sb.is_element_present('iframe[title*="Cloudflare"]'):
-                    log(f"[{tag}] Turnstile 验证框已消失, 视为放行")
-                    return True
-            except Exception:
-                continue
-        save_shot(sb, f"{tag}_turnstile_retry{round_no}")
-    log(f"[{tag}] Turnstile 在 {timeout} 秒内未放行")
-    save_shot(sb, f"{tag}_turnstile_failed")
-    return False
+    log(f"[{tag}] 等验证框消失超时({timeout}s), 仍尝试点 Continue 看能否推进")
+    return True
 
 
 def walk_shrinkme(sb, flow_handle, main_handle, tag):
@@ -1363,17 +1369,35 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     log(f"[{tag}] shrinkme 页: {sb.get_current_url()}")
 
     # --- 第 1 步: 验证页 ---
-    if not pass_turnstile(sb, flow_handle, main_handle, tag):
-        return False
-    ok = click_and_settle(
-        sb,
-        ['//button[contains(., "Click here to continue")]',
-         '//a[contains(., "Click here to continue")]',
-         'button:contains("Click here to continue")'],
-        flow_handle, main_handle, f"{tag}_step1_continue")
-    save_shot(sb, f"{tag}_after_step1")
-    if not ok:
-        log(f"[{tag}] 第 1 步 Continue 点击失败")
+    # 过验证码 -> 点 Continue -> 确认页面真的离开了验证页。
+    # 若点完仍停留在验证页(仍有 check the captcha 提示), 说明验证码
+    # 没真正通过, 回炉重来, 最多 3 轮, 避免在验证页上白等 Get Link。
+    advanced = False
+    for cycle in range(1, 4):
+        if not pass_turnstile(sb, flow_handle, main_handle, tag):
+            return False
+        ok = click_and_settle(
+            sb,
+            ['//button[contains(., "Click here to continue")]',
+             '//a[contains(., "Click here to continue")]',
+             'button:contains("Click here to continue")'],
+            flow_handle, main_handle, f"{tag}_step1_continue")
+        save_shot(sb, f"{tag}_after_step1")
+        if not ok:
+            log(f"[{tag}] 第 1 步 Continue 点击失败")
+            return False
+        sb.sleep(3)
+        focus_window(sb, flow_handle)
+        try:
+            still_captcha = sb.is_text_visible("Please check the captcha")
+        except Exception:
+            still_captcha = False
+        if not still_captcha:
+            advanced = True
+            break
+        log(f"[{tag}] 第 {cycle} 轮 Continue 后仍停留在验证页, 回炉重过验证码...")
+    if not advanced:
+        log(f"[{tag}] 多轮后仍未离开验证页, 验证码未真正通过")
         return False
 
     # --- 第 2 步: 中间博客页 STEP 1 OF 2 -> CLICK TO VERIFY ---
@@ -1461,14 +1485,27 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
 
 
 def find_add_button(sb, hours):
-    """在 Overview 页找 Add XX Hours 按钮, 返回 (xpath, 元素或None)"""
-    xpath = (f'//button[contains(., "Add") and contains(., "{hours}")] | '
-             f'//a[contains(., "Add") and contains(., "{hours}")]')
-    try:
-        els = [e for e in sb.find_elements(xpath, by="xpath") if e.is_displayed()]
-        return xpath, (els[0] if els else None)
-    except Exception:
-        return xpath, None
+    """在 Overview 页找 Add XX Hours 按钮, 返回 (xpath, 元素或None)。
+    放宽两点(run 41754237293 里 Add 12 明明可见却没找到):
+    1) 按钮可能不是 <button>/<a>(如 div 模拟按钮), 兜底按精确文本
+       "Add XX Hours" 找任意元素;
+    2) 面板可能渲染稍慢, 轮询 3 次再放弃。"""
+    xpaths = [
+        (f'//button[contains(., "Add") and contains(., "{hours}")] | '
+         f'//a[contains(., "Add") and contains(., "{hours}")]'),
+        f'//*[normalize-space()="Add {hours} Hours"]',
+    ]
+    for _ in range(3):
+        for xpath in xpaths:
+            try:
+                els = [e for e in sb.find_elements(xpath, by="xpath")
+                       if e.is_displayed()]
+                if els:
+                    return xpath, els[0]
+            except Exception:
+                continue
+        sb.sleep(3)
+    return xpaths[0], None
 
 
 def run_add_flow(sb, main_handle, hours, before_minutes):
