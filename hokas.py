@@ -1608,6 +1608,31 @@ def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=60):
     return True
 
 
+def go_home_base(sb, flow_handle, main_handle, first_url, tag):
+    """回到 Add 跳转后的第一个页面(shrinkme 首页面)。
+    见 walk_shrinkme 首页面注释: Get Link 在首页面上, 文章页只是支路。
+    切回 flow 窗口, 关掉多余窗口(支路/广告页), 若当前 URL 已不是首页面,
+    就直接导航回首页面 URL, 等 5 秒。返回是否已回到首页面 URL。"""
+    if not first_url:
+        return False
+    try:
+        focus_window(sb, flow_handle)
+        close_extra_windows(sb, {flow_handle, main_handle})
+        focus_window(sb, flow_handle)
+        cur = sb.get_current_url() or ""
+        if cur != first_url:
+            log(f"[{tag}] 回到首页面: {cur} -> {first_url}")
+            sb.driver.get(first_url)
+            sb.sleep(5)
+            close_extra_windows(sb, {flow_handle, main_handle})
+            focus_window(sb, flow_handle)
+        cur2 = sb.get_current_url() or ""
+        return cur2 == first_url
+    except Exception as e:
+        log(f"[{tag}] 回到首页面异常: {e}")
+        return False
+
+
 def walk_shrinkme(sb, flow_handle, main_handle, tag):
     """
     走完一条 shrinkme 短链(三步), 成功跳回 hokas.net 返回 True。
@@ -1617,6 +1642,16 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     sb.sleep(5)
     save_shot(sb, f"{tag}_shrinkme_open")
     log(f"[{tag}] shrinkme 页: {sb.get_current_url()}")
+    # 首页面: Add 跳转后的第一个页面。Deborah 2026-11-04 指出: Get Link
+    # 在这个首页面上, 不在文章页上; 文章页是做任务的支路, 做完要离开、
+    # 回到首页面继续。之前代码一直在文章页上点 Continue, 点到了文章
+    # 自己的分页(#smg-next), 那个页面既无工具条也无 Get Link, 是条死路。
+    # 因此全程记下首页面 URL, 迷路时就导航回这里找 Get Link。
+    try:
+        first_url = sb.get_current_url() or ""
+    except Exception:
+        first_url = ""
+    log(f"[{tag}] 首页面(迷路时跳回原点): {first_url}")
 
     # --- 第 1 步: 验证页 ---
     # 过验证码 -> 点 Continue -> 确认页面真的离开了验证页。
@@ -1735,10 +1770,13 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                 close_extra_windows(sb, {flow_handle, main_handle})
                 focus_window(sb, flow_handle)
             else:
+                # 注意: 这里故意不含 //a[contains(., "Continue")]。
+                # 文章页上的 <a> Continue 是文章自己的分页链接, 点它只会
+                # 进 #smg-next(无工具条、无 Get Link 的死路, run 41783637585
+                # 就是这么卡住的)。工具条按钮是 <button>, 只点它才对。
                 ok2 = click_and_settle(
                     sb,
                     ['//button[contains(., "Continue")]',
-                     '//a[contains(., "Continue")]',
                      '//*[normalize-space()="Continue..."]',
                      '//input[contains(@value, "Continue")]'],
                     flow_handle, main_handle, f"{tag}_step2_scroll_continue_r{round_no}",
@@ -1804,8 +1842,14 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             # 倒计时自己会走完, 本轮只等, 不点
             sb.sleep(10)
             continue
-        # 主动尝试: 顶部工具条按钮 -> 底部工具条按钮 -> Continue 文字兜底
+        # 主动尝试: 顶部工具条按钮 -> 底部工具条按钮 -> 回到首页面找 Get Link
+        # (Deborah 2026-11-04: Get Link 在首页面上, 不在文章页上。)
+        # 两次工具条尝试都说无工具条时, 说明已迷路到纯文章页: 不要在文章页
+        # 上按文字点 Continue(会点中文章分页, #smg-next 陷阱), 而是回到
+        # 首页面, 下一轮的检查就在首页面上找 Get Link。
         acted = False
+        tb = ""
+        tb2 = ""
         try:
             sb.execute_script("window.scrollTo(0, 0)")
             sb.sleep(2)
@@ -1827,10 +1871,14 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                 log(f"[{tag}] 底部工具条尝试异常: {e}")
         if not acted:
             try:
-                js_res = _js_click_by_text(sb, "Continue...")
-                log(f"[{tag}] Get Link 坚持第 {cycle} 轮 JS 点 Continue...: {js_res}")
+                if tb == "no-toolbar" and tb2 == "no-toolbar" and first_url:
+                    ok_home = go_home_base(sb, flow_handle, main_handle, first_url, tag)
+                    log(f"[{tag}] Get Link 坚持第 {cycle} 轮无工具条, 回到首页面: {ok_home}")
+                else:
+                    js_res = _js_click_by_text(sb, "Continue...")
+                    log(f"[{tag}] Get Link 坚持第 {cycle} 轮 JS 点 Continue...: {js_res}")
             except Exception as e:
-                log(f"[{tag}] JS 点 Continue... 异常: {e}")
+                log(f"[{tag}] 回到首页面/JS 点 Continue... 异常: {e}")
         sb.sleep(10)
         close_extra_windows(sb, {flow_handle, main_handle})
         focus_window(sb, flow_handle)
@@ -1841,6 +1889,37 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             except Exception:
                 pass
     save_shot(sb, f"{tag}_getlink_page")
+    if not ready and first_url:
+        # 最后再按 Deborah 的办法试一次: 回到首页面找 Get Link。
+        # 坚持循环一直在文章页上耗, 而 Get Link 在首页面上。
+        # 若 Get Link 已出现但在倒计时中(不可点), 等倒计时走完
+        # (用户说 10 秒, 这里等最多 30 秒)。
+        log(f"[{tag}] 坚持循环未见 Get Link, 最后回到首页面再找一次...")
+        try:
+            go_home_base(sb, flow_handle, main_handle, first_url, tag)
+            for _ in range(6):
+                try:
+                    if sb.is_element_visible(get_link_sel):
+                        els = sb.find_elements(get_link_sel, by="xpath")
+                        if any(is_clickable(e) for e in els):
+                            ready = True
+                            log(f"[{tag}] 首页面上找到可点的 Get Link!")
+                            break
+                        log(f"[{tag}] 首页面 Get Link 在倒计时中, 等 5 秒...")
+                    elif _js_text_visible(sb, "Get Link"):
+                        ready = True
+                        log(f"[{tag}] 首页面上找到 Get Link(JS 检出)!")
+                        break
+                    else:
+                        log(f"[{tag}] 首页面上暂未见 Get Link")
+                        break
+                except Exception:
+                    break
+                if ready:
+                    break
+                sb.sleep(5)
+        except Exception as e:
+            log(f"[{tag}] 首页面找 Get Link 异常: {e}")
     if not ready:
         log(f"[{tag}] Get Link 坚持 480 秒仍未出现, 本次走不下去")
         return False
