@@ -282,22 +282,47 @@ def parse_hysteria2_uri(uri):
         "obfs": (q.get("obfs") or "").lower(),
         "obfs_password": q.get("obfs-password") or q.get("obfs_password") or "",
         "insecure": insecure,
+        # 新版 Xray 的证书指纹/验域名参数(见 build_xray_config_hysteria2)。
+        "pin": q.get("pinSHA256") or q.get("pcs") or q.get("pinnedPeerCertSha256") or "",
+        "vcn": q.get("vcn") or q.get("verifyPeerCertByName") or "",
     }
 
 
 def build_xray_config_hysteria2(node):
     """由 hy2 节点 dict 生成 Xray 配置 dict(纯函数, 便于单测)。
-    形状按新版 Xray-core 的 hysteria2 出站协议:
-    protocol=hysteria2, settings.servers[] 带 address/port/password,
-    obfs 在 server 内, TLS 在 streamSettings 里(alpn 必须是 h3)。
-    入站与 VLESS 版相同: 本地 socks 1080 + http 1081, 浏览器只连 1081。"""
-    server = {"address": node["address"], "port": node["port"],
-              "password": node["password"]}
-    if node["obfs"]:
-        server["obfs"] = {"type": node["obfs"],
-                          "password": node["obfs_password"]}
+    教训(2026-11-04 run 41797277254): 上游 Xray-core 根本不认
+    protocol="hysteria2"(本地实测: "unknown config id: hysteria2",
+    连 streamSettings.network="hysteria2" 也是 "unknown transport
+    protocol")——那个 hysteria2 出站形状属于第三方分支, 不是上游。
+    上游的正确形状是 legacy 的 hysteria v2(本地经 xray run -test 验证
+    Configuration OK): protocol="hysteria", settings 带 version=2,
+    streamSettings.network="hysteria", hysteriaSettings 里 version=2 +
+    auth=密码; salamander 混淆走 streamSettings.finalmask。
+    入站与 VLESS 版相同: 本地 socks 1080 + http 1081, 浏览器只连 1081。
+    非 salamander 的 obfs 暂不支持, 直接抛错让启动失败(零成本), 而不是
+    静默丢掉一个连接必需的参数、让后面登录阶段莫名其妙失败。"""
+    if node["obfs"] and node["obfs"] != "salamander":
+        raise ValueError(f"暂不支持 obfs 类型: {node['obfs']}(仅支持 salamander)")
+    # TLS: 新版 Xray(2026-06-01 起)已移除 allowInsecure, 含
+    # allowInsecure=true 的配置整个无法加载(本地实测报错)。所以这里
+    # 永远不写 allowInsecure: 证书有效时正常验证即可; 自签证书则需要
+    # 链接里带 pcs 证书指纹(否则只能靠默认验证, 连不上会在登录阶段
+    # 失败, 不耗验证码)。vcn 用于指定验域名。
     tls = {"serverName": node["sni"], "fingerprint": "chrome",
-           "alpn": ["h3"], "allowInsecure": bool(node["insecure"])}
+           "alpn": ["h3"]}
+    if node.get("pin"):
+        tls["pinnedPeerCertSha256"] = node["pin"]
+    if node.get("vcn"):
+        tls["verifyPeerCertByName"] = node["vcn"]
+    stream = {
+        "network": "hysteria", "security": "tls",
+        "tlsSettings": tls,
+        "hysteriaSettings": {"version": 2, "auth": node["password"]},
+    }
+    if node["obfs"] == "salamander":
+        stream["finalmask"] = {
+            "udp": [{"type": "salamander",
+                     "settings": {"password": node["obfs_password"]}}]}
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -307,10 +332,10 @@ def build_xray_config_hysteria2(node):
              "settings": {}},
         ],
         "outbounds": [
-            {"protocol": "hysteria2",
-             "settings": {"servers": [server]},
-             "streamSettings": {"network": "hysteria2", "security": "tls",
-                                "tlsSettings": tls}},
+            {"protocol": "hysteria",
+             "settings": {"version": 2, "address": node["address"],
+                          "port": node["port"]},
+             "streamSettings": stream},
         ],
     }
 
@@ -323,15 +348,25 @@ def start_hysteria2_proxy(uri):
     报 “Xray 进程已退出”, 属于启动失败, 同样零成本。"""
     global _xray_proc
     node = parse_hysteria2_uri(uri)
+    if node["insecure"] and not node.get("pin"):
+        log("注意: 链接要求 insecure=1, 但新版 Xray 已移除跳过证书验证的"
+            "功能, 本次按正常证书验证启动; 若节点证书有效则不受影响, "
+            "若是自签证书则连接阶段会失败(不耗验证码)")
     log("检测到 hysteria2 节点, 正在启动 Xray 转成本地代理...")
     xray = ensure_xray()
     cfg_path = "/tmp/xray-config.json"
     with open(cfg_path, "w") as f:
         json.dump(build_xray_config_hysteria2(node), f)
     os.chmod(cfg_path, 0o600)
+    # 教训(2026-11-04 run 41797277254): Xray 的 stderr 原先被丢进 DEVNULL,
+    # 它因配置不对而退出时日志里只剩 "Xray 进程已退出", 查不到原因。
+    # 现改为把 stderr 记到文件, 启动失败时把最后几行打进日志(不含配置
+    # 内容, 只有 Xray 自己的报错, 不会漏密码)。
+    err_path = "/tmp/xray-error.log"
+    err_f = open(err_path, "wb")
     _xray_proc = subprocess.Popen(
         [xray, "run", "-c", cfg_path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        stdout=subprocess.DEVNULL, stderr=err_f)
     atexit.register(_stop_xray)
     deadline = time.time() + 30
     while time.time() < deadline:
@@ -341,6 +376,12 @@ def start_hysteria2_proxy(uri):
                 return "127.0.0.1:1081"
         except OSError:
             if _xray_proc.poll() is not None:
+                try:
+                    err_f.close()
+                    tail = open(err_path, errors="replace").read()[-500:]
+                    log(f"Xray 报错(末尾): {tail.strip()}")
+                except Exception:
+                    pass
                 raise RuntimeError("Xray 进程已退出, hysteria2 转换失败")
             time.sleep(1)
     _stop_xray()
