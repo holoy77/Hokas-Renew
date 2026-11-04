@@ -1790,14 +1790,26 @@ def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=60):
     return True
 
 
+def _norm_btn_text(t):
+    """归一化按钮文本: 去首尾空白、合并空白(含不换行空格)、把省略号
+    字符(…/‥)统一成三个点。教训(run 41807429359): 覆盖层 "Continue..."
+    按钮截图里明明在, 但 <button> 精确文本没找到——渲染文本很可能
+    用的是 … 而不是 ...，精确匹配对不上。归一化后两者都对上。"""
+    if t is None:
+        return ""
+    t = str(t).replace("\u00a0", " ").replace("\u2026", "...").replace("\u2025", "...")
+    return " ".join(t.split())
+
+
 def _click_overlay_button(sb, flow_handle, main_handle, text, tag):
-    """只点覆盖层按钮: 按精确文本找 <button>, 绝不点 <a> 或其他元素。
+    """点覆盖层按钮, 绝不点文章分页 <a>。
     这是旧版卡死的核心教训: 文章页上有 <a> Continue(文章分页)、
     PREVIOUS/NEXT ARTICLE 等链接, 点中它们只会进 #smg-next 死路。
-    覆盖层按钮(CLIK TO VERIFY / Continue... / CONTINUE NEXT /
-    GENERATE LINK / CONTINUE TO YOUR LINK / Get Link / Click here to
-    continue)都是 <button>。先 XPath 精确文本找 button, 找不到再用 JS
-    只扫 BUTTON 标签按 innerText 精确匹配点。返回 True 表示点上了。
+    因此: 先 XPath 精确文本找 button; 再 JS 归一化精确匹配扫 BUTTON;
+    再 JS 归一化精确匹配扫除 <a> 外的叶元素(覆盖层按钮可能不是
+    <button>, 但 <a> 排除在外, 且匹配的是完整目标文本——分页 <a>
+    的 "Continue" 缺三个点, 对不上 "Continue...", 不会踩坑)。
+    全部失败时把页面 BUTTON 文本打进日志, 下次不再靠猜。
     点完关弹窗标签页、切回主标签页, 并打点击前后 URL。"""
     if not focus_window(sb, flow_handle):
         log(f"[{tag}] 覆盖层按钮[{text}]: 主窗口已不存在")
@@ -1817,22 +1829,59 @@ def _click_overlay_button(sb, flow_handle, main_handle, text, tag):
         log(f"[{tag}] 覆盖层按钮[{text}] XPath 点击异常: {e}")
     if not clicked:
         try:
-            lit = json.dumps(text)
+            lit = json.dumps(_norm_btn_text(text))
             js = (
+                "function norm(s){ return (s||'').replace(/\\u00a0/g,' ')"
+                ".replace(/\\u2026/g,'...').replace(/\\u2025/g,'...')"
+                ".replace(/\\s+/g,' ').trim(); }"
+                "var target = " + lit + ";"
                 "var els = document.querySelectorAll('button');"
                 "for (var i = 0; i < els.length; i++) {"
-                "  var t = (els[i].innerText || els[i].textContent || '').trim();"
-                "  if (t === " + lit + ") {"
+                "  if (norm(els[i].innerText || els[i].textContent) === target) {"
                 "    els[i].scrollIntoView({block: 'center'});"
                 "    els[i].click();"
-                "    return 'clicked';"
+                "    return 'clicked-button';"
+                "  }"
+                "}"
+                "var all = document.querySelectorAll('*');"
+                "var matches = [];"
+                "for (var j = 0; j < all.length; j++) {"
+                "  var el = all[j];"
+                "  if (el.tagName === 'A') continue;"
+                "  if (norm(el.innerText || el.textContent) === target) matches.push(el);"
+                "}"
+                "var leaf = matches.filter(function(el){"
+                "  return !matches.some(function(m){ return m !== el && el.contains(m); });"
+                "});"
+                "for (var k = 0; k < leaf.length; k++) {"
+                "  var r = leaf[k].getBoundingClientRect();"
+                "  if (r.width > 0 && r.height > 0) {"
+                "    leaf[k].scrollIntoView({block: 'center'});"
+                "    leaf[k].click();"
+                "    return 'clicked-leaf';"
                 "  }"
                 "}"
                 "return 'not-found';"
             )
             res = sb.execute_script(js)
-            clicked = (res == "clicked")
-            log(f"[{tag}] 覆盖层按钮[{text}] JS 按 BUTTON 文本点: {res}")
+            clicked = (res == "clicked-button" or res == "clicked-leaf")
+            log(f"[{tag}] 覆盖层按钮[{text}] JS 归一化点: {res}")
+            if not clicked:
+                try:
+                    dump_js = (
+                        "var els = document.querySelectorAll('button');"
+                        "var out = [];"
+                        "for (var i = 0; i < els.length && out.length < 20; i++) {"
+                        "  var t = (els[i].innerText || els[i].textContent || '')"
+                        "    .replace(/\\s+/g, ' ').trim();"
+                        "  if (t) out.push(t);"
+                        "}"
+                        "return out.join(' | ');"
+                    )
+                    log(f"[{tag}] 覆盖层按钮[{text}] 未找到, 页面 BUTTON 文本: "
+                        f"{sb.execute_script(dump_js)}")
+                except Exception:
+                    pass
         except Exception as e:
             log(f"[{tag}] 覆盖层按钮[{text}] JS 点击异常: {e}")
     sb.sleep(5)
@@ -2446,7 +2495,11 @@ def _js_find_start_button(sb):
     (可能元素不是 <button>, 或取到时已被每秒重渲染 stale 掉)。
     因此用 JS 现查: 只扫 button/a/[role=button], 文本含 Start 且不含
     Restart, 矩形可见且未禁用, 返回第一个; 找不到返回 None。
-    JS 现查没有 stale 问题(每次都是 fresh DOM 查询)。"""
+    JS 现查没有 stale 问题(每次都是 fresh DOM 查询)。
+    兜底(run 41807429359 教训): button/a/[role=button] 扫不到时, 再扫
+    全部元素取叶节点(文本含 Start、不含 Restart、矩形可见、无含 Start
+    的后代元素), 文本最短者优先(按钮文本 "▶ Start" 短, 祖先容器文本
+    长, 不会被误取; 长度相同取文档顺序第一个)。"""
     js = """
     var els = document.querySelectorAll('button, a, [role="button"]');
     for (var i = 0; i < els.length; i++) {
@@ -2456,12 +2509,50 @@ def _js_find_start_button(sb):
         if (r.width > 0 && r.height > 0 && !els[i].disabled) return els[i];
       }
     }
-    return null;
+    var all = document.querySelectorAll('*');
+    var matches = [];
+    for (var j = 0; j < all.length; j++) {
+      var el = all[j];
+      var t2 = (el.innerText || el.textContent || '').trim();
+      if (t2.indexOf('Start') !== -1 && t2.indexOf('Restart') === -1) {
+        var r2 = el.getBoundingClientRect();
+        if (r2.width > 0 && r2.height > 0) matches.push(el);
+      }
+    }
+    var leaf = matches.filter(function(el) {
+      return !matches.some(function(m) { return m !== el && el.contains(m); });
+    });
+    var best = null, bestLen = 1e9;
+    for (var k = 0; k < leaf.length; k++) {
+      var lt = (leaf[k].innerText || leaf[k].textContent || '').trim().length;
+      if (lt < bestLen) { bestLen = lt; best = leaf[k]; }
+    }
+    return best;
     """
     try:
         return sb.execute_script(js)
     except Exception:
         return None
+
+
+def _js_dump_start_candidates(sb):
+    """失败诊断: 列出页面上文本含 Start 的元素(标签+文本, 最多 15 个),
+    下次 Start 找不到时不再靠猜它的真实标签。"""
+    js = """
+    var all = document.querySelectorAll('*');
+    var out = [];
+    for (var i = 0; i < all.length && out.length < 15; i++) {
+      var t = (all[i].innerText || all[i].textContent || '').replace(/\\s+/g, ' ').trim();
+      if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1 && t.length < 80) {
+        out.push(all[i].tagName + '|' + t);
+      }
+    }
+    return out.join('; ');
+    """
+    try:
+        return sb.execute_script(js) or ""
+    except Exception:
+        return ""
 
 
 def ensure_started(sb):
@@ -2516,7 +2607,11 @@ def ensure_started(sb):
                 return "already_running"
         except Exception:
             pass
-        log("[Start] 未找到可点的 Start 按钮")
+        try:
+            log(f"[Start] 未找到可点的 Start 按钮, 含 Start 的元素: "
+                f"{_js_dump_start_candidates(sb)}")
+        except Exception:
+            log("[Start] 未找到可点的 Start 按钮")
         return "no_button"
     try:
         btn_text = (start_el.text or "").strip()
