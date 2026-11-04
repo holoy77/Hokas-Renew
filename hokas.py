@@ -1405,50 +1405,46 @@ def _js_toolbar_button(sb, click):
     按文字找会在第 2 轮后反复点中文章链接, URL 再也不动。
     因此按容器定位: 含 ShrinkMe.io 标识的最小容器之父级即工具条,
     在其中找第一个可见的非空按钮/链接(排除 logo 本身)。
+    教训(run 41774629178): 上一版包成 IIFE 后每轮都返回 None(不是
+    no-toolbar, 也不是 no-button), 等于没执行, 程序只能回落到按文字
+    点 Continue, 结果和上一跑一模一样。本版改用和 _js_find_by_text
+    相同的写法——顶层裸 return(已被验证能在该驱动上返回值), 并用
+    textContent(不触发布局, 快)找标识; 返回值为空时统一转成
+    'none-result' 字符串, 日志里不再出现裸 None。
     click=True 时点它, 否则只返回是否找到。"""
     do_click = "true" if click else "false"
     js = (
-        "(function(){"
-        "function vis(el){"
-        "  if(!el) return false;"
-        "  try{ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0; }"
-        "  catch(e){ return false; }"
+        "var bar = null, best = 1e9;"
+        "var cands = document.querySelectorAll('a, span, div, header');"
+        "for (var i = 0; i < cands.length; i++) {"
+        "  var t = (cands[i].textContent || '').trim();"
+        "  if (t.indexOf('ShrinkMe.io') >= 0 && t.length < best) { best = t.length; bar = cands[i]; }"
         "}"
-        "function walk(root,out){"
-        "  var els=root.querySelectorAll('*');"
-        "  for(var i=0;i<els.length;i++){"
-        "    var el=els[i];"
-        "    if(el.shadowRoot) walk(el.shadowRoot,out);"
-        "    out.push(el);"
-        "  }"
-        "}"
-        "var all=[]; walk(document,all);"
-        "var bar=null,best=1e9;"
-        "for(var i=0;i<all.length;i++){"
-        "  var t=(all[i].innerText||'').trim();"
-        "  if(t.indexOf('ShrinkMe.io')>=0 && t.length<best){ best=t.length; bar=all[i]; }"
-        "}"
-        "if(!bar) return 'no-toolbar';"
-        "var scopes=[]; var p=bar;"
-        "for(var s=0;s<3 && p;s++){ p=p.parentElement; if(p) scopes.push(p); }"
-        "for(var si=0;si<scopes.length;si++){"
-        "  var cands=scopes[si].querySelectorAll('button, a, input[type=button], input[type=submit]');"
-        "  for(var j=0;j<cands.length;j++){"
-        "    var c=cands[j];"
-        "    var ct=(c.innerText||c.value||'').trim();"
-        "    if(!vis(c)) continue;"
-        "    if(ct===''||ct==='ShrinkMe.io') continue;"
-        "    if(" + do_click + "){ c.scrollIntoView({block:'center'}); c.click(); return 'clicked:'+c.tagName+':'+ct; }"
-        "    return 'found:'+c.tagName+':'+ct;"
+        "if (!bar) { return 'no-toolbar'; }"
+        "var scopes = []; var p = bar;"
+        "for (var s = 0; s < 3 && p; s++) { p = p.parentElement; if (p) { scopes.push(p); } }"
+        "for (var si = 0; si < scopes.length; si++) {"
+        "  var btns = scopes[si].querySelectorAll('button, a, input[type=button], input[type=submit]');"
+        "  for (var j = 0; j < btns.length; j++) {"
+        "    var c = btns[j];"
+        "    var ct = (c.innerText || c.value || c.textContent || '').trim();"
+        "    var r = null;"
+        "    try { r = c.getBoundingClientRect(); } catch (e) { continue; }"
+        "    if (!r || r.width <= 0 || r.height <= 0) { continue; }"
+        "    if (ct === '' || ct === 'ShrinkMe.io') { continue; }"
+        "    if (" + do_click + ") { c.scrollIntoView({block: 'center'}); c.click(); return 'clicked:' + c.tagName + ':' + ct; }"
+        "    return 'found:' + c.tagName + ':' + ct;"
         "  }"
         "}"
         "return 'no-button';"
-        "})()"
     )
     try:
-        return sb.execute_script(js)
+        res = sb.execute_script(js)
     except Exception as e:
         return f"js-error: {e}"
+    if res is None:
+        return "none-result"
+    return res
 
 
 def _js_text_visible(sb, text):
@@ -1744,17 +1740,26 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
         log(f"[{tag}] 滚动点击阶段结束, 进入第 3 步")
 
     # --- 第 3 步: YOUR LINK IS ALMOST READY -> 倒计时 -> Get Link ---
+    # Deborah 2026-11-04 指令: 没看到 Get Link 就一直做任务, 不要等 120 秒就放弃。
+    # 因此这里不再是被动等待, 而是主动坚持: 每轮先查 Get Link, 查不到且
+    # 不在倒计时状态时, 就滚到顶部点工具条按钮(不管它叫什么)、滚到底再
+    # 点一次、最后按 Continue 文字点, 直到 Get Link 出现或 480 秒预算用完。
+    # 预算 480 秒: 单个 Add 走完约 15 分钟, 两个 Add + Start 约 31 分钟,
+    # 在 40 分钟任务时限内, 不会把任务拖死。倒计时状态下不点任何按钮,
+    # 等倒计时自己走完才是正确做法, 点反而可能打断它。
     focus_window(sb, flow_handle)
-    deadline = time.time() + 120
     get_link_sel = ('//button[contains(., "Get Link")] | '
                     '//a[contains(., "Get Link")] | '
                     '//*[normalize-space()="Get Link"] | '
                     '//input[contains(@value, "Get Link")]')
     ready = False
-    waited = 0
-    while time.time() < deadline:
+    persist_deadline = time.time() + 480
+    cycle = 0
+    while time.time() < persist_deadline:
+        cycle += 1
         close_extra_windows(sb, {flow_handle, main_handle})
         focus_window(sb, flow_handle)
+        countdown_state = False
         try:
             if "hokas.net" in sb.get_current_url():
                 log(f"[{tag}] 已跳回 hokas.net")
@@ -1766,8 +1771,10 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                     ready = True
                     break
                 log(f"[{tag}] Get Link 已出现但暂不可点(倒计时中)...")
+                countdown_state = True
             elif sb.is_text_visible("YOUR LINK IS ALMOST READY"):
                 log(f"[{tag}] 倒计时进行中...")
+                countdown_state = True
             elif _js_text_visible(sb, "Get Link"):
                 # XPath 未命中但 JS 检出: 文本空白符差异, 点 Get Link 环节有 JS 兜底
                 log(f"[{tag}] Get Link 已出现(JS 检出, XPath 未命中)...")
@@ -1775,17 +1782,51 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                 break
         except Exception:
             pass
-        sb.sleep(5)
-        waited += 5
-        if waited % 30 == 0:
-            # 每 30 秒留一条进度, 免得下次看日志只剩空白
+        if ready:
+            break
+        if countdown_state:
+            # 倒计时自己会走完, 本轮只等, 不点
+            sb.sleep(10)
+            continue
+        # 主动尝试: 顶部工具条按钮 -> 底部工具条按钮 -> Continue 文字兜底
+        acted = False
+        try:
+            sb.execute_script("window.scrollTo(0, 0)")
+            sb.sleep(2)
+            tb = _js_toolbar_button(sb, click=True)
+            log(f"[{tag}] Get Link 坚持第 {cycle} 轮顶部工具条按钮: {tb}")
+            if isinstance(tb, str) and tb.startswith("clicked:"):
+                acted = True
+        except Exception as e:
+            log(f"[{tag}] 顶部工具条尝试异常: {e}")
+        if not acted:
             try:
-                log(f"[{tag}] 等 Get Link 中({waited}s, 当前: {sb.get_current_url()})")
+                sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+                sb.sleep(2)
+                tb2 = _js_toolbar_button(sb, click=True)
+                log(f"[{tag}] Get Link 坚持第 {cycle} 轮底部工具条按钮: {tb2}")
+                if isinstance(tb2, str) and tb2.startswith("clicked:"):
+                    acted = True
+            except Exception as e:
+                log(f"[{tag}] 底部工具条尝试异常: {e}")
+        if not acted:
+            try:
+                js_res = _js_click_by_text(sb, "Continue...")
+                log(f"[{tag}] Get Link 坚持第 {cycle} 轮 JS 点 Continue...: {js_res}")
+            except Exception as e:
+                log(f"[{tag}] JS 点 Continue... 异常: {e}")
+        sb.sleep(10)
+        close_extra_windows(sb, {flow_handle, main_handle})
+        focus_window(sb, flow_handle)
+        if cycle % 3 == 0:
+            save_shot(sb, f"{tag}_getlink_persist_c{cycle}")
+            try:
+                log(f"[{tag}] Get Link 坚持第 {cycle} 轮结束, 当前: {sb.get_current_url()}")
             except Exception:
                 pass
     save_shot(sb, f"{tag}_getlink_page")
     if not ready:
-        log(f"[{tag}] Get Link 在时限内未变为可点击")
+        log(f"[{tag}] Get Link 坚持 480 秒仍未出现, 本次走不下去")
         return False
     # 点 Get Link: popunder 会吞掉点击, 点完关广告回 flow 窗口重点, 直到跳回 hokas
     for attempt in range(1, 5):
@@ -1899,6 +1940,51 @@ def _js_find_by_contains(sb, *needles):
         return None
 
 
+def _js_find_visible_by_text(sb, text):
+    """用 JS 按精确渲染文本找元素, 且要求它在屏幕上有尺寸, 返回 WebElement 或 None。
+    绕过 Selenium is_displayed 在这类面板上的误判: 元素明明渲染在屏
+    幕上, is_displayed 却可能因祖先样式返回 False, 而 getBoundingClientRect
+    量出的尺寸是实的。写法与 _js_find_by_text 相同(顶层裸 return)。
+    调用方仍用 WebDriver 原生点击, 且 is_clickable 只查 enabled/属性, 不查 displayed。"""
+    lit = json.dumps(text)
+    lit_up = json.dumps(text.upper())
+    js = (
+        "var out = [], outCi = [];"
+        "function walk(root) {"
+        "  var els = root.querySelectorAll('*');"
+        "  for (var i = 0; i < els.length; i++) {"
+        "    var el = els[i];"
+        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
+        "    var t = (el.innerText || el.textContent || '').trim();"
+        "    var r = null;"
+        "    try { r = el.getBoundingClientRect(); } catch (e) { continue; }"
+        "    if (!r || r.width <= 0 || r.height <= 0) { continue; }"
+        "    if (t === " + lit + ") { out.push(el); }"
+        "    else if (t.toUpperCase() === " + lit_up + ") { outCi.push(el); }"
+        "  }"
+        "}"
+        "var docs = [document];"
+        "var frs = document.querySelectorAll('iframe');"
+        "for (var k = 0; k < frs.length; k++) {"
+        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
+        "  catch (e) {}"
+        "}"
+        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
+        "var cands = out.length > 0 ? out : outCi;"
+        "if (cands.length === 0) { return null; }"
+        "for (var j = 0; j < cands.length; j++) {"
+        "  if (['BUTTON', 'A', 'INPUT'].indexOf(cands[j].tagName) >= 0) {"
+        "    return cands[j];"
+        "  }"
+        "}"
+        "return cands[cands.length - 1];"
+    )
+    try:
+        return sb.execute_script(js)
+    except Exception:
+        return None
+
+
 def find_add_button(sb, hours):
     """在 Overview 页找 Add XX Hours 按钮, 返回 (xpath, 元素或None)。
     放宽两点(run 41754237293 里 Add 12 明明可见却没找到):
@@ -1950,6 +2036,17 @@ def find_add_button(sb, hours):
                     return "JS", el
             except Exception:
                 pass
+    except Exception:
+        pass
+    # 精确/子串文本都找到了元素、却因 is_displayed 误判被丢掉时,
+    # 改按 JS 量尺寸判断(在屏幕上有尺寸即视为可见): run 41774629178
+    # 的 DOM 证据证明 <BUTTON>Add 12 Hours</BUTTON> 就在主文档里,
+    # 找不到的原因只剩可见性判断这一环。
+    try:
+        el = _js_find_visible_by_text(sb, f"Add {hours} Hours")
+        if el is not None:
+            log(f"[Add {hours} Hours] JS 尺寸兜底找到按钮")
+            return "JS", el
     except Exception:
         pass
     # 全部找不到时留一份 DOM 证据, 下次不再靠猜。
@@ -2078,6 +2175,86 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
 
 
 # ---------------- 主流程 ----------------
+def ensure_started(sb):
+    """过期服务器加时长后仍是 Stopped, 必须点 Start 才能真正上线。
+    (Deborah 2026-11-04 指出: 页面有 Start 按钮, 加完时长直接启动。
+    之前脚本只核对剩余时间, 从没处理过 Start——这是个缺口。)
+    仅当剩余时间 > 0 时尝试; 运行中的服务器不动。
+    返回 "started" / "already_running" / "no_time" / "start_failed" / "no_button"。"""
+    try:
+        remaining, _ = get_remaining(sb)
+    except Exception:
+        remaining = None
+    if remaining is not None and remaining <= 0:
+        log("[Start] 剩余时间为 0, 无时长可启动, 跳过 Start")
+        return "no_time"
+    # 找 Start 按钮: 优先精确文本, 再含 Start 且非 Restart
+    # (Restart 里是小写 start, capital S 的 Start 本就区分, 再加一层排除更稳)。
+    start_el = None
+    for xpath in ['//button[normalize-space()="Start"]',
+                  '//button[contains(., "Start") and not(contains(., "Restart"))]']:
+        try:
+            for e in sb.find_elements(xpath, by="xpath"):
+                try:
+                    if e.is_enabled():
+                        start_el = e
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            continue
+        if start_el is not None:
+            break
+    if start_el is None:
+        try:
+            el = _js_find_by_text(sb, "Start")
+            if el is not None:
+                start_el = el
+        except Exception:
+            pass
+    if start_el is None:
+        # 没有可点的 Start 按钮: 可能已在运行(Start 被禁用/消失)
+        try:
+            if sb.is_text_visible("Running") or sb.is_text_visible("RUNNING"):
+                log("[Start] 已在运行, 无需启动")
+                return "already_running"
+        except Exception:
+            pass
+        log("[Start] 未找到可点的 Start 按钮")
+        return "no_button"
+    try:
+        btn_text = (start_el.text or "").strip()
+    except Exception:
+        btn_text = ""
+    try:
+        sb.execute_script("arguments[0].scrollIntoView({block:'center'});", start_el)
+        sb.sleep(1)
+        start_el.click()
+        log(f"[Start] 已点击 Start 按钮[{btn_text}], 等待启动...")
+    except Exception as e:
+        log(f"[Start] 点击 Start 失败: {e}")
+        return "start_failed"
+    # 启动需要时间: 最多等 60 秒, 看到 Running 即成功
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        sb.sleep(5)
+        try:
+            if sb.is_text_visible("Running") or sb.is_text_visible("RUNNING"):
+                log("[Start] 服务器已进入 Running, 启动成功")
+                return "started"
+        except Exception:
+            pass
+    # 超时后最后确认一次: Stopped 是否消失
+    try:
+        if not sb.is_text_visible("Stopped"):
+            log("[Start] 等待超时但 Stopped 已消失, 视为已启动")
+            return "started"
+    except Exception:
+        pass
+    log("[Start] 等待 60 秒仍未确认 Running, 启动结果未知")
+    return "start_failed"
+
+
 def main():
     if not EMAIL:
         log("错误: 必须配置 EMAIL 环境变量")
@@ -2153,6 +2330,19 @@ def main():
                     result_lines.append(
                         f"🕒 续期后剩余: {final_raw or str(final) + ' 分钟'}"
                         f" (净增 {final - before} 分钟)")
+                # 过期服务器加时长后仍是 Stopped, 必须点 Start 才真正上线
+                # (Deborah 指出: 页面有 Start 按钮, 加完时长直接启动)。
+                # 只在剩余 > 0 时尝试; 运行中的服务器 ensure_started 会不动。
+                try:
+                    start_status = ensure_started(sb)
+                    if start_status == "started":
+                        result_lines.append("▶️ 服务器已点 Start 启动")
+                    elif start_status == "already_running":
+                        result_lines.append("▶️ 服务器已在运行, 无需启动")
+                    elif start_status != "no_time":
+                        result_lines.append(f"⚠️ Start 未确认({start_status})")
+                except Exception as e:
+                    log(f"[Start] 启动步骤异常: {e}")
                 save_shot(sb, "final_overview")
             except Exception:
                 # 失败时兜底截图, 便于通过 Artifact 排查
