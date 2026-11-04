@@ -2033,18 +2033,30 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
         save_shot(sb, f"{tag}_no_scroll_hint1")
         return False
     _scroll_to_bottom(sb)
+    # 滚到底后覆盖层状态可能已翻转: 实测(run 41810242412)滚到底后页面
+    # BUTTON 只有 CONTINUE NEXT, 没有 Continue...——滚到底这个动作本身
+    # 就把覆盖层推到了底部状态。因此 Continue... 点不上时, 直接试
+    # CONTINUE NEXT(它就是同一步的下一个按钮), 点上就跳过下面那次
+    # 重复的滚到底+CONTINUE NEXT, 直接去等 STEP 2。
+    _continue_next_done = False
     if not _click_overlay_button(sb, flow_handle, main_handle,
                                  "Continue...", f"{tag}_step2_continue"):
-        log(f"[{tag}] STEP 1 的 Continue... 点不上")
-        return False
+        log(f"[{tag}] STEP 1 的 Continue... 不在, 试 CONTINUE NEXT(滚到底后覆盖层可能已变)")
+        if _click_overlay_button(sb, flow_handle, main_handle,
+                                 "CONTINUE NEXT", f"{tag}_step2_continue_next_early"):
+            _continue_next_done = True
+        else:
+            log(f"[{tag}] STEP 1 的 Continue.../CONTINUE NEXT 都点不上")
+            return False
     if on_hokas():
         return True
-    # 滚到底后底出现 CONTINUE NEXT(点 Continue... 后页面到底部, URL 带 #smg-next)
-    _scroll_to_bottom(sb)
-    if not _click_overlay_button(sb, flow_handle, main_handle,
-                                 "CONTINUE NEXT", f"{tag}_step2_continue_next"):
-        log(f"[{tag}] CONTINUE NEXT 点不上")
-        return False
+    if not _continue_next_done:
+        # 滚到底后底出现 CONTINUE NEXT(点 Continue... 后页面到底部, URL 带 #smg-next)
+        _scroll_to_bottom(sb)
+        if not _click_overlay_button(sb, flow_handle, main_handle,
+                                     "CONTINUE NEXT", f"{tag}_step2_continue_next"):
+            log(f"[{tag}] CONTINUE NEXT 点不上")
+            return False
     if on_hokas():
         return True
     # 应进 STEP 2 OF 2
@@ -2059,17 +2071,26 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
         save_shot(sb, f"{tag}_no_scroll_hint2")
         return False
     _scroll_to_bottom(sb)
+    # 与 STEP 1 同理: 滚到底后覆盖层可能已直接是 GENERATE LINK, Continue...
+    # 不在时直接试它, 点上就跳过下面那次重复的滚到底+GENERATE LINK。
+    _generate_done = False
     if not _click_overlay_button(sb, flow_handle, main_handle,
                                  "Continue...", f"{tag}_step3_continue"):
-        log(f"[{tag}] STEP 2 的 Continue... 点不上")
-        return False
+        log(f"[{tag}] STEP 2 的 Continue... 不在, 试 GENERATE LINK(滚到底后覆盖层可能已变)")
+        if _click_overlay_button(sb, flow_handle, main_handle,
+                                 "GENERATE LINK", f"{tag}_step3_generate_early"):
+            _generate_done = True
+        else:
+            log(f"[{tag}] STEP 2 的 Continue.../GENERATE LINK 都点不上")
+            return False
     if on_hokas():
         return True
-    _scroll_to_bottom(sb)
-    if not _click_overlay_button(sb, flow_handle, main_handle,
-                                 "GENERATE LINK", f"{tag}_step3_generate"):
-        log(f"[{tag}] GENERATE LINK 点不上")
-        return False
+    if not _generate_done:
+        _scroll_to_bottom(sb)
+        if not _click_overlay_button(sb, flow_handle, main_handle,
+                                     "GENERATE LINK", f"{tag}_step3_generate"):
+            log(f"[{tag}] GENERATE LINK 点不上")
+            return False
     if on_hokas():
         return True
     # 应变 CONTINUE TO YOUR LINK
@@ -2536,15 +2557,21 @@ def _js_find_start_button(sb):
 
 
 def _js_dump_start_candidates(sb):
-    """失败诊断: 列出页面上文本含 Start 的元素(标签+文本, 最多 15 个),
-    下次 Start 找不到时不再靠猜它的真实标签。"""
+    """失败诊断: 列出页面上文本含 Start 的元素(标签+文本+是否禁用+
+    矩形+class, 最多 15 个)。教训(run 41810242412): dump 只说
+    BUTTON|Start 存在, 却没说它是不是禁用/不可见——而查找器恰恰
+    只认可用可见的按钮, 所以下次必须把禁用和矩形也打出来, 才能
+    定性是“禁用中”还是“查找器漏网”。"""
     js = """
     var all = document.querySelectorAll('*');
     var out = [];
     for (var i = 0; i < all.length && out.length < 15; i++) {
       var t = (all[i].innerText || all[i].textContent || '').replace(/\\s+/g, ' ').trim();
       if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1 && t.length < 80) {
-        out.push(all[i].tagName + '|' + t);
+        var r = all[i].getBoundingClientRect();
+        out.push(all[i].tagName + '|' + t + '|disabled=' + (!!all[i].disabled)
+          + '|rect=' + Math.round(r.width) + 'x' + Math.round(r.height)
+          + '|class=' + (all[i].className || '').toString().slice(0, 40));
       }
     }
     return out.join('; ');
@@ -2570,9 +2597,12 @@ def ensure_started(sb):
         return "no_time"
     # 找 Start 按钮: 先 XPath(精确/含文本), 再旧 JS 兜底, 再 JS 新鲜
     # 查找(抗 stale, 且覆盖非 <button> 元素)。每秒重渲染会让取到的
-    # 元素 stale, 因此最多重试 3 轮, 每轮都是 fresh 查询。
+    # 元素 stale, 且按钮可能在导航回来后过一阵才变可用, 因此最多等
+    # 60 秒(每轮 fresh 查询), 找到可用按钮立刻停, 而不是 3 轮快查
+    # 就放弃(教训 run 41810242412: 按钮明明在 DOM 里却没捞到)。
     start_el = None
-    for _attempt in range(3):
+    _start_deadline = time.time() + 60
+    while time.time() < _start_deadline and start_el is None:
         for xpath in ['//button[normalize-space()="Start"]',
                       '//button[contains(., "Start") and not(contains(., "Restart"))]']:
             try:
