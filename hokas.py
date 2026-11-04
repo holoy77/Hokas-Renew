@@ -1293,10 +1293,48 @@ def _find_button_in_frames(sb, selectors):
     return None
 
 
-def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3):
+def _js_click_by_text(sb, text):
+    """用 JS 遍历 light DOM + shadow root, 按精确文本找元素并点击。
+    普通 XPath/CSS 穿不透 shadow DOM: 截图可见、所有选择器都找不到时,
+    按钮最可能就藏在 shadow root 里。返回 'clicked:TAG' 或 'not-found'。
+    文本用 json 转义后拼进 JS, 不经过 execute_script 的 arguments 参数
+    (旧版曾因 arguments 未定义而崩过)。"""
+    lit = json.dumps(text)
+    js = (
+        "var out = [];"
+        "function walk(root) {"
+        "  var els = root.querySelectorAll('*');"
+        "  for (var i = 0; i < els.length; i++) {"
+        "    var el = els[i];"
+        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
+        "    if ((el.innerText || '').trim() === " + lit + ") { out.push(el); }"
+        "  }"
+        "}"
+        "walk(document);"
+        "if (out.length === 0) { return 'not-found'; }"
+        "var el = null;"
+        "for (var j = 0; j < out.length; j++) {"
+        "  if (['BUTTON', 'A', 'INPUT'].indexOf(out[j].tagName) >= 0) {"
+        "    el = out[j]; break;"
+        "  }"
+        "}"
+        "if (!el) { el = out[out.length - 1]; }"
+        "el.scrollIntoView({block: 'center'});"
+        "el.click();"
+        "return 'clicked:' + el.tagName;"
+    )
+    try:
+        return sb.execute_script(js)
+    except Exception as e:
+        return f"js-error: {e}"
+
+
+def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3,
+                     button_text=None):
     """
     在 flow 窗口(shrinkme/中间页)里点击目标按钮, 处理 popunder:
     每次点击后关掉多余广告窗、切回 flow 窗口; 若页面无变化则重点。
+    找按钮的顺序: 普通选择器 -> iframe -> JS 穿透 shadow DOM 按文本点。
     返回 True 表示至少成功点了一次。
     """
     clicked_any = False
@@ -1308,16 +1346,25 @@ def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3):
         el = _find_button_selector(sb, selectors)
         if not el:
             el = _find_button_in_frames(sb, selectors)
-        if not el:
+        js_clicked = False
+        if not el and button_text:
+            js_res = _js_click_by_text(sb, button_text)
+            log(f"[{tag}] JS 兜底找按钮({button_text}): {js_res}")
+            js_clicked = isinstance(js_res, str) and js_res.startswith("clicked:")
+        if not el and not js_clicked:
             log(f"[{tag}] 第 {attempt} 次: 未找到可点击按钮")
             sb.sleep(3)
             continue
-        try:
-            sb.click(el)
+        if js_clicked:
             clicked_any = True
-            log(f"[{tag}] 第 {attempt} 次点击: {el}")
-        except Exception as e:
-            log(f"[{tag}] 点击异常: {e}")
+            log(f"[{tag}] 第 {attempt} 次 JS 点击成功")
+        else:
+            try:
+                sb.click(el)
+                clicked_any = True
+                log(f"[{tag}] 第 {attempt} 次点击: {el}")
+            except Exception as e:
+                log(f"[{tag}] 点击异常: {e}")
         sb.sleep(5)
         # 关掉这次点击弹出的广告窗, 切回 flow 窗口
         close_extra_windows(sb, {flow_handle, main_handle})
@@ -1416,7 +1463,8 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
              '//*[normalize-space()="Click here to continue"]',
              '//input[contains(@value, "Click here to continue")]',
              'button:contains("Click here to continue")'],
-            flow_handle, main_handle, f"{tag}_step1_continue")
+            flow_handle, main_handle, f"{tag}_step1_continue",
+            button_text="Click here to continue")
         save_shot(sb, f"{tag}_after_step1")
         if not ok:
             log(f"[{tag}] 第 1 步 Continue 点击失败")
@@ -1453,7 +1501,8 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
              '//*[normalize-space()="CLICK TO VERIFY"]',
              '//input[contains(@value, "CLICK TO VERIFY")]',
              'button:contains("CLICK TO VERIFY")'],
-            flow_handle, main_handle, f"{tag}_step2_verify")
+            flow_handle, main_handle, f"{tag}_step2_verify",
+            button_text="CLICK TO VERIFY")
         save_shot(sb, f"{tag}_after_step2")
         if not ok:
             log(f"[{tag}] 第 2 步 CLICK TO VERIFY 点击失败")
@@ -1500,6 +1549,8 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             log(f"[{tag}] 第 {attempt} 次点击 Get Link")
         except Exception as e:
             log(f"[{tag}] 点击 Get Link 异常: {e}")
+            js_res = _js_click_by_text(sb, "Get Link")
+            log(f"[{tag}] JS 兜底点 Get Link: {js_res}")
         sb.sleep(5)
         # 成功的话 flow 窗口本身会跳到 hokas, 或新开 hokas 窗口
         for h in list(sb.driver.window_handles):
@@ -1537,8 +1588,14 @@ def find_add_button(sb, hours):
     for _ in range(3):
         for xpath in xpaths:
             try:
-                els = [e for e in sb.find_elements(xpath, by="xpath")
-                       if e.is_displayed()]
+                els = []
+                for e in sb.find_elements(xpath, by="xpath"):
+                    try:
+                        if e.is_displayed():
+                            els.append(e)
+                    except Exception:
+                        # 单个元素过期(如倒计时每秒重绘面板)不能带走整批结果
+                        continue
                 if els:
                     return xpath, els[0]
             except Exception:
