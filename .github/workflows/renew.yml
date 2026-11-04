@@ -47,6 +47,12 @@ jobs:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           SIGN_IN_URL: ${{ secrets.SIGN_IN_URL }}
           SERVER_NAME: ${{ secrets.SERVER_NAME }}
+          # 服务器 ID(可选, 如 b9275): 设置后优先按 ID 找卡片, 不怕名字拼错。
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+          # 家宽代理节点(可选): 直连过不了 shrinkme 验证时, 配了它就走家宽 IP。
+          # 在仓库 Settings -> Secrets 里新建名为 PROXY 的 Secret, 值形如
+          # http://user:pass@host:port 或 socks5://user:pass@host:port。
+          PROXY: ${{ secrets.PROXY }}
         run: |
           set -o pipefail
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 hokas.py 2>&1 | tee log.txt
