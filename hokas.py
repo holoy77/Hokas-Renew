@@ -1760,25 +1760,33 @@ def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=60):
     if _captcha_gone(sb):
         log(f"[{tag}] 验证码框已不在, 视为已通过")
         return True
-    try:
-        log(f"[{tag}] 尝试点击 Turnstile 验证框...")
-        sb.uc_gui_click_captcha()
-    except Exception as e:
-        log(f"[{tag}] uc_gui_click_captcha 异常: {e}")
-        return False
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        sb.sleep(5)
-        close_extra_windows(sb, {flow_handle, main_handle})
-        focus_window(sb, flow_handle)
+    # 验证码点击最多试 2 次: 教训(run 41804154827): 第一次点击后框仍
+    # 是空的(没打勾), 150 秒都没绿。第一次点击可能根本没落上, 因此
+    # 框还在时再点一次; 若 Cloudflare 认出了跑者浏览器, 重打也没用,
+    # 届时仍返回 True 让调用方试 Continue、由推进与否最终判定。
+    for _attempt in range(2):
         try:
-            if _captcha_gone(sb):
-                log(f"[{tag}] 验证码框已消失")
-                save_shot(sb, f"{tag}_turnstile_passed")
-                return True
-        except Exception:
-            pass
-    log(f"[{tag}] 等验证框消失超时({timeout}s), 仍尝试点 Continue 看能否推进")
+            log(f"[{tag}] 尝试点击 Turnstile 验证框(第 {_attempt + 1} 次)...")
+            sb.uc_gui_click_captcha()
+        except Exception as e:
+            log(f"[{tag}] uc_gui_click_captcha 异常: {e}")
+            if _attempt == 0:
+                return False
+            break
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            sb.sleep(5)
+            close_extra_windows(sb, {flow_handle, main_handle})
+            focus_window(sb, flow_handle)
+            try:
+                if _captcha_gone(sb):
+                    log(f"[{tag}] 验证码框已消失")
+                    save_shot(sb, f"{tag}_turnstile_passed")
+                    return True
+            except Exception:
+                pass
+        log(f"[{tag}] 第 {_attempt + 1} 次点击后验证框仍在")
+    log(f"[{tag}] 验证框 2 次点击后仍在, 仍尝试点 Continue 看能否推进")
     return True
 
 
@@ -2316,6 +2324,19 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
     返回 "credited" / "walk_failed" / "not_credited" / "unavailable"
     """
     tag = f"add{hours}h"
+    # 冷却跳过(必须在找按钮之前): 面板会写 "12h option used - try again
+    # after 22:39 (24h still available)"。教训(run 41804154827): 原先
+    # 先找按钮、后查冷却, Add 12 的查找 miss(可见性怪问题)还没走到
+    # 冷却检查就返回了“未找到按钮”, 冷却跳过成了死代码。面板文字是
+    # 可靠的(截图里明明白白写着), 所以先查文字, 冷却中直接跳过,
+    # 根本不需要找按钮。已冷却的按钮不要走(走了也不到账, 白白耗一次
+    # shrinkme 流程)。
+    try:
+        if sb.is_text_visible(f"{hours}h option used"):
+            log(f"[Add {hours} Hours] 面板显示该选项已用(冷却中), 跳过不走")
+            return "unavailable"
+    except Exception:
+        pass
     xpath, el = find_add_button(sb, hours)
     if el is None:
         log(f"[Add {hours} Hours] 未找到按钮(可能面板结构变化或未到可用时间)")
@@ -2325,16 +2346,6 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
     if not is_clickable(el):
         log(f"[Add {hours} Hours] 按钮[{btn_text}]不可点击(6 小时冷却中)")
         return "unavailable"
-    # 冷却跳过: 面板会写 "12h option used - try again after 22:39
-    # (24h still available)"。已冷却的按钮不要走(走了也不到账, 白白
-    # 耗一次 shrinkme 流程)。Deborah 2026-11-04 手动续 12h 后, 12h
-    # 选项冷却到 22:39, 24h 仍可用, 因此下次跑应只走 Add 24 + Start。
-    try:
-        if sb.is_text_visible(f"{hours}h option used"):
-            log(f"[Add {hours} Hours] 面板显示该选项已用(冷却中), 跳过不走")
-            return "unavailable"
-    except Exception:
-        pass
     try:
         sb.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         sb.sleep(1)
@@ -2428,6 +2439,31 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
 
 
 # ---------------- 主流程 ----------------
+def _js_find_start_button(sb):
+    """用 JS 在当前 DOM 里新鲜查找 Start 按钮(抗 stale)。
+    教训(run 41804154827): Overview 右上角明明有白色“▶ Start”按钮,
+    但 XPath 精确文本 "Start" 对不上“▶ Start”, 含 Start 的兜底也没捞到
+    (可能元素不是 <button>, 或取到时已被每秒重渲染 stale 掉)。
+    因此用 JS 现查: 只扫 button/a/[role=button], 文本含 Start 且不含
+    Restart, 矩形可见且未禁用, 返回第一个; 找不到返回 None。
+    JS 现查没有 stale 问题(每次都是 fresh DOM 查询)。"""
+    js = """
+    var els = document.querySelectorAll('button, a, [role="button"]');
+    for (var i = 0; i < els.length; i++) {
+      var t = (els[i].innerText || els[i].textContent || '').trim();
+      if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1) {
+        var r = els[i].getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && !els[i].disabled) return els[i];
+      }
+    }
+    return null;
+    """
+    try:
+        return sb.execute_script(js)
+    except Exception:
+        return None
+
+
 def ensure_started(sb):
     """过期服务器加时长后仍是 Stopped, 必须点 Start 才能真正上线。
     (Deborah 2026-11-04 指出: 页面有 Start 按钮, 加完时长直接启动。
@@ -2441,30 +2477,37 @@ def ensure_started(sb):
     if remaining is not None and remaining <= 0:
         log("[Start] 剩余时间为 0, 无时长可启动, 跳过 Start")
         return "no_time"
-    # 找 Start 按钮: 优先精确文本, 再含 Start 且非 Restart
-    # (Restart 里是小写 start, capital S 的 Start 本就区分, 再加一层排除更稳)。
+    # 找 Start 按钮: 先 XPath(精确/含文本), 再旧 JS 兜底, 再 JS 新鲜
+    # 查找(抗 stale, 且覆盖非 <button> 元素)。每秒重渲染会让取到的
+    # 元素 stale, 因此最多重试 3 轮, 每轮都是 fresh 查询。
     start_el = None
-    for xpath in ['//button[normalize-space()="Start"]',
-                  '//button[contains(., "Start") and not(contains(., "Restart"))]']:
-        try:
-            for e in sb.find_elements(xpath, by="xpath"):
-                try:
-                    if e.is_enabled():
-                        start_el = e
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            continue
+    for _attempt in range(3):
+        for xpath in ['//button[normalize-space()="Start"]',
+                      '//button[contains(., "Start") and not(contains(., "Restart"))]']:
+            try:
+                for e in sb.find_elements(xpath, by="xpath"):
+                    try:
+                        if e.is_enabled():
+                            start_el = e
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+            if start_el is not None:
+                break
+        if start_el is None:
+            try:
+                el = _js_find_by_text(sb, "Start")
+                if el is not None:
+                    start_el = el
+            except Exception:
+                pass
+        if start_el is None:
+            start_el = _js_find_start_button(sb)
         if start_el is not None:
             break
-    if start_el is None:
-        try:
-            el = _js_find_by_text(sb, "Start")
-            if el is not None:
-                start_el = el
-        except Exception:
-            pass
+        sb.sleep(2)
     if start_el is None:
         # 没有可点的 Start 按钮: 可能已在运行(Start 被禁用/消失)
         try:
@@ -2479,18 +2522,29 @@ def ensure_started(sb):
         btn_text = (start_el.text or "").strip()
     except Exception:
         btn_text = ""
+    _clicked = False
     try:
         sb.execute_script("arguments[0].scrollIntoView({block:'center'});", start_el)
         sb.sleep(1)
         start_el.click()
-        try:
-            cur_u = sb.get_current_url() or ""
-        except Exception:
-            cur_u = ""
-        log(f"[Start] 已点击 Start 按钮[{btn_text}] (点击时 URL: {cur_u}), 等待启动...")
+        _clicked = True
     except Exception as e:
-        log(f"[Start] 点击 Start 失败: {e}")
+        log(f"[Start] 正常点击失败({e}), JS 新鲜查找一次并 JS 点击...")
+        try:
+            fresh = _js_find_start_button(sb)
+            if fresh is not None:
+                sb.execute_script("arguments[0].click();", fresh)
+                _clicked = True
+        except Exception as e2:
+            log(f"[Start] JS 点击也失败: {e2}")
+    if not _clicked:
+        log("[Start] 点击 Start 失败")
         return "start_failed"
+    try:
+        cur_u = sb.get_current_url() or ""
+    except Exception:
+        cur_u = ""
+    log(f"[Start] 已点击 Start 按钮[{btn_text}] (点击时 URL: {cur_u}), 等待启动...")
     # 启动需要时间: 最多等 60 秒, 看到 Running 即成功
     deadline = time.time() + 60
     while time.time() < deadline:
