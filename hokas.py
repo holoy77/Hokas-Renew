@@ -1571,16 +1571,29 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     else:
         log(f"[{tag}] 未出现 STEP 中间页, 直接进入第 3 步(当前: {sb.get_current_url()})")
 
-    # --- 第 2.5 步: 点完验证后 STEP 页会变成 "To scroll down, click Continue..." ---
-    # 必须把文章页滚到底再点 Continue..., 否则永远停在 STEP 1 OF 2,
-    # 第 3 步等 Get Link 只是白等 120 秒(run 41763090685 的截图证明了这点)。
+    # --- 第 2.5 步: STEP 1 和 STEP 2 都要滚到底再点 Continue... ---
+    # STEP 1 提示是 "To scroll down, click Continue...",
+    # STEP 2 提示是 "Scroll down to Generate Link, or click Continue...",
+    # 两处都含 "click Continue"。只做一轮的话, 会在 STEP 2 OF 2 页上
+    # 白等 Get Link 120 秒(run 41766250866 的截图证明了这点)。
+    # Deborah 的建议: Continue 按钮多点几次 —— 因此一直点下去:
+    # 只要还看到提示/按钮就滚到底+点, 点不上也不立刻放弃, 下轮重滚重试;
+    # 直到提示消失(进了倒计时)才进第 3 步, 最多 6 轮封顶。
     if is_step_page:
-        try:
-            scroll_hint = sb.is_text_visible("To scroll down, click Continue")
-        except Exception:
-            scroll_hint = False
-        if scroll_hint:
-            log(f"[{tag}] 出现滚到底提示, 正在分段滚动页面...")
+        saw_hint = False
+        clicked_once = False
+        for round_no in range(1, 7):
+            try:
+                scroll_hint = sb.is_text_visible("click Continue") \
+                    or _js_text_visible(sb, "Continue...")
+            except Exception:
+                scroll_hint = False
+            if not scroll_hint:
+                if saw_hint:
+                    log(f"[{tag}] 滚到底提示已消失, 进入倒计时判断")
+                break
+            saw_hint = True
+            log(f"[{tag}] 第 {round_no} 轮滚到底提示, 正在分段滚动页面...")
             focus_window(sb, flow_handle)
             try:
                 # 懒加载页面滚到底后高度还会变, 每步重读高度, 直到滚不动为止
@@ -1602,14 +1615,19 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                  '//a[contains(., "Continue")]',
                  '//*[normalize-space()="Continue..."]',
                  '//input[contains(@value, "Continue")]'],
-                flow_handle, main_handle, f"{tag}_step2_scroll_continue",
+                flow_handle, main_handle, f"{tag}_step2_scroll_continue_r{round_no}",
                 button_text="Continue...")
-            save_shot(sb, f"{tag}_after_scroll_continue")
-            if not ok2:
-                log(f"[{tag}] 滚到底后 Continue... 点击失败")
-                return False
-            log(f"[{tag}] 已点 Continue..., 等待进入倒计时页")
+            save_shot(sb, f"{tag}_after_scroll_continue_r{round_no}")
+            if ok2:
+                clicked_once = True
+                log(f"[{tag}] 第 {round_no} 轮 Continue... 已点, 等待下一步")
+            else:
+                log(f"[{tag}] 第 {round_no} 轮 Continue... 未点上, 下轮重滚重试")
             sb.sleep(3)
+        if saw_hint and not clicked_once:
+            log(f"[{tag}] 多轮 Continue... 均未点上")
+            return False
+        log(f"[{tag}] 滚动点击阶段结束, 进入第 3 步")
 
     # --- 第 3 步: YOUR LINK IS ALMOST READY -> 倒计时 -> Get Link ---
     focus_window(sb, flow_handle)
@@ -1730,6 +1748,43 @@ def _js_find_by_text(sb, text):
         return None
 
 
+def _js_find_by_contains(sb, *needles):
+    """用 JS 按子串找元素(渲染文本同时包含所有 needles), 返回 WebElement 或 None。
+    精确文本匹配会被图标字符/多余空白破坏, 子串匹配不受影响; 不分标签。"""
+    conds = " && ".join(
+        f"(t.indexOf({json.dumps(n)}) >= 0)" for n in needles)
+    js = (
+        "var out = [];"
+        "function walk(root) {"
+        "  var els = root.querySelectorAll('*');"
+        "  for (var i = 0; i < els.length; i++) {"
+        "    var el = els[i];"
+        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
+        "    var t = (el.innerText || el.textContent || '').trim();"
+        "    if (" + conds + ") { out.push(el); }"
+        "  }"
+        "}"
+        "var docs = [document];"
+        "var frs = document.querySelectorAll('iframe');"
+        "for (var k = 0; k < frs.length; k++) {"
+        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
+        "  catch (e) {}"
+        "}"
+        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
+        "if (out.length === 0) { return null; }"
+        "for (var j = 0; j < out.length; j++) {"
+        "  if (['BUTTON', 'A', 'INPUT'].indexOf(out[j].tagName) >= 0) {"
+        "    return out[j];"
+        "  }"
+        "}"
+        "return out[out.length - 1];"
+    )
+    try:
+        return sb.execute_script(js)
+    except Exception:
+        return None
+
+
 def find_add_button(sb, hours):
     """在 Overview 页找 Add XX Hours 按钮, 返回 (xpath, 元素或None)。
     放宽两点(run 41754237293 里 Add 12 明明可见却没找到):
@@ -1770,6 +1825,34 @@ def find_add_button(sb, hours):
                 pass
     except Exception:
         pass
+    # 精确文本也找不到时, 按子串找(图标字符/多余空白会破坏精确匹配,
+    # 但 "Add"+"12" 子串一定在): 不分标签, 优先 button/a/input。
+    try:
+        el = _js_find_by_contains(sb, "Add", str(hours))
+        if el is not None:
+            try:
+                if el.is_displayed():
+                    log(f"[Add {hours} Hours] JS 子串兜底找到按钮")
+                    return "JS", el
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # 全部找不到时留一份 DOM 证据, 下次不再靠猜。
+    try:
+        dump = sb.execute_script(
+            "var out = [];"
+            "var els = document.querySelectorAll('*');"
+            "for (var i = 0; i < els.length; i++) {"
+            "  var t = (els[i].innerText || els[i].textContent || '').trim();"
+            "  if (t.indexOf('Add') >= 0 && t.length < 60) {"
+            "    out.push(els[i].tagName + '|' + t);"
+            "  }"
+            "}"
+            "return out.slice(0, 20).join('; ');")
+        log(f"[Add {hours} Hours] DOM 证据(文本含 Add 的元素): {dump}")
+    except Exception as e:
+        log(f"[Add {hours} Hours] DOM 证据采集失败: {e}")
     return xpaths[0], None
 
 
