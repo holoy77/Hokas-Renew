@@ -1635,65 +1635,123 @@ def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=60):
     return True
 
 
-def return_to_shrinkme(sb, flow_handle, main_handle, first_url, tag):
-    """回到首页面(shrinkme 第一页)。
-    Deborah 2026-11-04 的模型: 流程页永远是首页面; 任务页(文章页)
-    是支路, 点完就关掉/退出, 下一步永远从首页面点。
-    回去的办法(按窗口死亡教训):
-    - 先关多余窗口: 若任务页是新开的标签页, 它在这里就被关掉,
-      flow 标签页(首页面)原封不动, 直接就算回来了。
-    - 若是同标签页导航过去的(当前 URL 已不是首页面):
-      用浏览器后退(driver.back())回到首页面——绝不用 driver.get(首页面 URL),
-      因为 run 41786815173/41788226427 两次证明: 在 flow 标签页里
-      driver.get(首页面 URL) 后窗口立即死亡(no such window)。
-    - 后退一次不够时再后退一次(中间可能有一次跳转)。
-    返回是否已回到首页面 URL。"""
-    if not first_url:
+def _click_overlay_button(sb, flow_handle, main_handle, text, tag):
+    """只点覆盖层按钮: 按精确文本找 <button>, 绝不点 <a> 或其他元素。
+    这是旧版卡死的核心教训: 文章页上有 <a> Continue(文章分页)、
+    PREVIOUS/NEXT ARTICLE 等链接, 点中它们只会进 #smg-next 死路。
+    覆盖层按钮(CLIK TO VERIFY / Continue... / CONTINUE NEXT /
+    GENERATE LINK / CONTINUE TO YOUR LINK / Get Link / Click here to
+    continue)都是 <button>。先 XPath 精确文本找 button, 找不到再用 JS
+    只扫 BUTTON 标签按 innerText 精确匹配点。返回 True 表示点上了。
+    点完关弹窗标签页、切回主标签页, 并打点击前后 URL。"""
+    if not focus_window(sb, flow_handle):
+        log(f"[{tag}] 覆盖层按钮[{text}]: 主窗口已不存在")
         return False
     try:
-        close_extra_windows(sb, {flow_handle, main_handle})
-        if not focus_window(sb, flow_handle):
-            return False
-        cur = sb.get_current_url() or ""
-        if cur == first_url:
-            return True
-        log(f"[{tag}] 回首页面: 当前在任务页 {cur}, 用后退回首页面(不用 driver.get)")
-        for _ in range(2):
-            try:
-                sb.driver.back()
-            except Exception as e:
-                log(f"[{tag}] 后退异常: {e}")
-                return False
-            sb.sleep(5)
-            close_extra_windows(sb, {flow_handle, main_handle})
-            if not focus_window(sb, flow_handle):
-                return False
-            cur = sb.get_current_url() or ""
-            if cur == first_url:
-                log(f"[{tag}] 已后退回首页面: {cur}")
-                return True
-        log(f"[{tag}] 后退两次仍未回首页面, 当前: {cur} (期望 {first_url})")
-        return False
+        before_url = sb.get_current_url() or ""
+    except Exception:
+        before_url = ""
+    log(f"[{tag}] 点覆盖层按钮[{text}] (点击前 URL: {before_url})")
+    clicked = False
+    try:
+        sel = f'//button[normalize-space()="{text}"]'
+        if sb.is_element_visible(sel):
+            sb.click(sel)
+            clicked = True
     except Exception as e:
-        log(f"[{tag}] 回首页面异常: {e}")
-        return False
+        log(f"[{tag}] 覆盖层按钮[{text}] XPath 点击异常: {e}")
+    if not clicked:
+        try:
+            lit = json.dumps(text)
+            js = (
+                "var els = document.querySelectorAll('button');"
+                "for (var i = 0; i < els.length; i++) {"
+                "  var t = (els[i].innerText || els[i].textContent || '').trim();"
+                "  if (t === " + lit + ") {"
+                "    els[i].scrollIntoView({block: 'center'});"
+                "    els[i].click();"
+                "    return 'clicked';"
+                "  }"
+                "}"
+                "return 'not-found';"
+            )
+            res = sb.execute_script(js)
+            clicked = (res == "clicked")
+            log(f"[{tag}] 覆盖层按钮[{text}] JS 按 BUTTON 文本点: {res}")
+        except Exception as e:
+            log(f"[{tag}] 覆盖层按钮[{text}] JS 点击异常: {e}")
+    sb.sleep(5)
+    # 点完会弹任务/广告标签页: 只关不点, 切回主标签页
+    close_extra_windows(sb, {flow_handle, main_handle})
+    focus_window(sb, flow_handle)
+    try:
+        after_url = sb.get_current_url() or ""
+    except Exception:
+        after_url = ""
+    log(f"[{tag}] 覆盖层按钮[{text}] 点后 URL: {after_url}")
+    return clicked
+
+
+def _scroll_to_bottom(sb):
+    """分段滚到底(懒加载页面滚到底后高度还会变, 每步重读高度)。"""
+    try:
+        y = 0
+        for _ in range(60):
+            h = sb.execute_script("return document.body.scrollHeight") or 0
+            if y >= h:
+                break
+            sb.execute_script(f"window.scrollTo(0, {y})")
+            y += 500
+            sb.sleep(1)
+        sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+        sb.sleep(3)
+    except Exception as e:
+        log(f"滚动到底异常: {e}")
+
+
+def _wait_text(sb, text, timeout=30):
+    """等页面出现某段文本, 返回是否出现。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if sb.is_text_visible(text):
+                return True
+        except Exception:
+            pass
+        sb.sleep(2)
+    return False
 
 
 def walk_shrinkme(sb, flow_handle, main_handle, tag):
     """
     走完一条 shrinkme 短链, 成功跳回 hokas.net 返回 True。
-    flow_handle: 点击 Add 后新开的 shrinkme 标签页。
-    Deborah 2026-11-04 的模型(两次用截图逐行纠正后定稿):
-    - 流程页永远是首页面(shrinkme 第一页)。每一步的点击都从首页面出发;
-      Get Link 只在首页面上, 不在任务页上。
-    - 任务页(文章页, 如 themezon)是支路: 点击导致跳到任务页后,
-      不在上面点、不在上面滚、不在上面找工具条/Get Link——等几秒
-      (给它自动跳回的机会), 还在任务页上就关掉它/后退回首页面,
-      再看首页面推进到了哪一步。
-    - 绝不在 flow 标签页里 driver.get(首页面 URL): 两次复现证明那会
-      关窗口。回去只用关标签页或浏览器后退。
-    - 任务页上的 CLICK TO VERIFY、滚动 Continue 全部删掉: 它们是旧版
-      在错误页面上瞎点(截图 06:56-07:00 的日志就是证据)。
+    flow_handle: 点击 Add 后新开的 shrinkme 标签页(主标签页)。
+    真实流程(Deborah 2026-11-04 手动成功 16 步截图定稿):
+    1. 首页面(shrinkme.click/XXX): Turnstile 框 -> 勾选 -> 等约 30 秒变绿
+       “成功!” -> 点 "Click here to continue"。关键: 必须等绿再点;
+       点早了会跳任务页但步骤不算数(run 41790459629 的 6 轮就是这样,
+       但那次还有后退恢复旧状态的叠加原因, 见下)。
+    2. 点 Continue 后: 主标签页进 themezon STEP 页, 同时弹出任务/广告
+       标签页(如 Yahoo、hai8g.com)——弹窗只关不点(里面的“确认”框是
+       广告陷阱), 关完回到主标签页。主标签页跟随流程走, 绝不后退、
+       绝不用 driver.get 回首页面: 后退会恢复旧状态(验证页), 等于白点;
+       driver.get 回首页面会关窗口(两次复现)。
+    3. themezon STEP 1 OF 2: 点覆盖层 "CLICK TO VERIFY" -> 弹窗 -> 关掉。
+       页变 "To scroll down, click Continue..." + "Continue..." -> 滚到底
+       点 "Continue..." -> 底出现 "CONTINUE NEXT" -> 点 -> 弹窗 -> 关掉。
+       页变 STEP 2 OF 2。
+    4. themezon STEP 2 OF 2: "Scroll down to Generate Link, or click
+       Continue..." + "Continue..." -> 滚到底点 "Continue..." -> 底出现
+       "GENERATE LINK" -> 点 -> 弹窗 -> 关掉。页变 "CONTINUE TO YOUR
+       LINK" -> 点 -> 回到首页面(shrinkme.click)倒计时。
+    5. 首页面: "YOUR LINK IS ALMOST READY." + 10 秒倒计时("Please
+       wait...") -> 等倒计时走完 -> 点 "Get Link" -> 跳回 hokas.net。
+    按钮铁律: 只点覆盖层按钮, 且只按精确文本点 <button>
+    ("CLICK TO VERIFY" / "Continue..." / "CONTINUE NEXT" / "GENERATE
+    LINK" / "CONTINUE TO YOUR LINK" / "Get Link" / "Click here to
+    continue")。绝不点 <a> Continue(文章分页)、绝不点文章自己的
+    PREVIOUS/NEXT ARTICLE——旧版就是点中文章分页(#smg-next)才卡死的。
+    每步都有界: 等文本最多 30 秒, 点不上就截图停下, 不瞎转。
     """
     focus_window(sb, flow_handle)
     sb.sleep(5)
@@ -1703,14 +1761,8 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     except Exception:
         first_url = ""
     log(f"[{tag}] shrinkme 页: {first_url}")
-    log(f"[{tag}] 首页面(流程页, 全程只在这里点): {first_url}")
     if not first_url:
         return False
-
-    get_link_sel = ('//button[contains(., "Get Link")] | '
-                    '//a[contains(., "Get Link")] | '
-                    '//*[normalize-space()="Get Link"] | '
-                    '//input[contains(@value, "Get Link")]')
 
     def on_hokas():
         try:
@@ -1718,166 +1770,150 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
         except Exception:
             return False
 
-    def on_shrinkme():
-        try:
-            return (sb.get_current_url() or "") == first_url
-        except Exception:
-            return False
+    def settle_popups():
+        """关弹窗标签页、切回主标签页。"""
+        close_extra_windows(sb, {flow_handle, main_handle})
+        focus_window(sb, flow_handle)
 
-    def get_link_ready():
-        """首页面上 Get Link 是否已出现且可点。"""
+    # --- 阶段 1: 首页面验证码 ---
+    # 手动截图证明: 勾选后约 30 秒变绿“成功!”, 然后点 Continue。
+    # 因此这里不以“框消失”为通过标准(框变绿后仍在), 而是:
+    # 点框 -> 等绿(成功/Success)最多 90 秒 -> 绿了就点 Continue;
+    # 90 秒仍未绿, 也试一次 Continue(旧版有过第 2 轮过的先例),
+    # 但打明日志: 这次可能不算数。
+    if not pass_turnstile(sb, flow_handle, main_handle, tag):
+        return False
+    green = False
+    try:
+        green = sb.is_text_visible("成功") or sb.is_text_visible("Success")
+    except Exception:
+        pass
+    if not green:
+        log(f"[{tag}] 验证码框点后等绿(最多 90 秒)...")
+        deadline = time.time() + 90
+        while time.time() < deadline and not green:
+            sb.sleep(5)
+            settle_popups()
+            try:
+                green = sb.is_text_visible("成功") or sb.is_text_visible("Success")
+            except Exception:
+                pass
+        log(f"[{tag}] 验证码变绿: {green}")
+    if not green:
+        log(f"[{tag}] 验证码 90 秒仍未绿, 仍试一次 Continue(这次可能不算数)")
+    if not _click_overlay_button(sb, flow_handle, main_handle,
+                                 "Click here to continue", f"{tag}_step1_continue"):
+        log(f"[{tag}] 首页面 Continue 点不上")
+        return False
+    save_shot(sb, f"{tag}_after_step1")
+    if on_hokas():
+        return True
+    # 点完主标签页应进 themezon STEP 页(弹窗已在点完时关掉)
+    if not _wait_text(sb, "STEP 1 OF 2", timeout=30) and \
+            not _wait_text(sb, "CLICK TO VERIFY", timeout=10):
+        log(f"[{tag}] 点 Continue 后未进 STEP 1 页, 当前: {sb.get_current_url()}")
+        save_shot(sb, f"{tag}_no_step1")
+        return False
+
+    # --- 阶段 2: themezon STEP 1 OF 2 ---
+    if not _click_overlay_button(sb, flow_handle, main_handle,
+                                 "CLICK TO VERIFY", f"{tag}_step2_verify"):
+        log(f"[{tag}] CLICK TO VERIFY 点不上")
+        return False
+    save_shot(sb, f"{tag}_after_step2")
+    if on_hokas():
+        return True
+    # 应变 "To scroll down, click Continue..." + Continue...
+    if not _wait_text(sb, "click Continue", timeout=30):
+        log(f"[{tag}] CLICK TO VERIFY 后未出现滚到底提示")
+        save_shot(sb, f"{tag}_no_scroll_hint1")
+        return False
+    _scroll_to_bottom(sb)
+    if not _click_overlay_button(sb, flow_handle, main_handle,
+                                 "Continue...", f"{tag}_step2_continue"):
+        log(f"[{tag}] STEP 1 的 Continue... 点不上")
+        return False
+    if on_hokas():
+        return True
+    # 滚到底后底出现 CONTINUE NEXT(点 Continue... 后页面到底部, URL 带 #smg-next)
+    _scroll_to_bottom(sb)
+    if not _click_overlay_button(sb, flow_handle, main_handle,
+                                 "CONTINUE NEXT", f"{tag}_step2_continue_next"):
+        log(f"[{tag}] CONTINUE NEXT 点不上")
+        return False
+    if on_hokas():
+        return True
+    # 应进 STEP 2 OF 2
+    if not _wait_text(sb, "STEP 2 OF 2", timeout=30):
+        log(f"[{tag}] CONTINUE NEXT 后未进 STEP 2 页")
+        save_shot(sb, f"{tag}_no_step2")
+        return False
+
+    # --- 阶段 3: themezon STEP 2 OF 2 ---
+    if not _wait_text(sb, "click Continue", timeout=30):
+        log(f"[{tag}] STEP 2 未出现滚到底提示")
+        save_shot(sb, f"{tag}_no_scroll_hint2")
+        return False
+    _scroll_to_bottom(sb)
+    if not _click_overlay_button(sb, flow_handle, main_handle,
+                                 "Continue...", f"{tag}_step3_continue"):
+        log(f"[{tag}] STEP 2 的 Continue... 点不上")
+        return False
+    if on_hokas():
+        return True
+    _scroll_to_bottom(sb)
+    if not _click_overlay_button(sb, flow_handle, main_handle,
+                                 "GENERATE LINK", f"{tag}_step3_generate"):
+        log(f"[{tag}] GENERATE LINK 点不上")
+        return False
+    if on_hokas():
+        return True
+    # 应变 CONTINUE TO YOUR LINK
+    if not _wait_text(sb, "CONTINUE TO YOUR LINK", timeout=30):
+        log(f"[{tag}] GENERATE LINK 后未出现 CONTINUE TO YOUR LINK")
+        save_shot(sb, f"{tag}_no_continue_to_link")
+        return False
+    if not _click_overlay_button(sb, flow_handle, main_handle,
+                                 "CONTINUE TO YOUR LINK", f"{tag}_step3_to_link"):
+        log(f"[{tag}] CONTINUE TO YOUR LINK 点不上")
+        return False
+    if on_hokas():
+        return True
+    # 应回首页面倒计时
+    settle_popups()
+    if not _wait_text(sb, "YOUR LINK IS ALMOST READY", timeout=30):
+        log(f"[{tag}] CONTINUE TO YOUR LINK 后未回首页面倒计时, 当前: {sb.get_current_url()}")
+        save_shot(sb, f"{tag}_no_countdown")
+        return False
+
+    # --- 阶段 4: 首页面倒计时 -> Get Link ---
+    get_link_sel = '//button[normalize-space()="Get Link"]'
+    deadline = time.time() + 90
+    ready = False
+    while time.time() < deadline:
+        settle_popups()
+        if on_hokas():
+            return True
         try:
             if sb.is_element_visible(get_link_sel):
                 els = sb.find_elements(get_link_sel, by="xpath")
                 if any(is_clickable(e) for e in els):
-                    return True
+                    ready = True
+                    break
                 log(f"[{tag}] Get Link 已出现但暂不可点(倒计时中)...")
-                return False
-            if _js_text_visible(sb, "Get Link"):
-                return True
+            elif sb.is_text_visible("YOUR LINK IS ALMOST READY"):
+                log(f"[{tag}] 首页面倒计时进行中...")
+            else:
+                log(f"[{tag}] 首页面倒计时页状态不明, 当前: {sb.get_current_url()}")
+                break
         except Exception:
             pass
-        return False
-
-    def in_countdown():
-        try:
-            return sb.is_text_visible("YOUR LINK IS ALMOST READY")
-        except Exception:
-            return False
-
-    def after_click_settle():
-        """一次点击后: 等 5 秒看自动跳转; 若已回 hokas 返回 'hokas';
-        若还在首页面返回 'shrinkme'; 若在任务页上, 回首页面后返回
-        'shrinkme' 或 'lost'。"""
         sb.sleep(5)
-        close_extra_windows(sb, {flow_handle, main_handle})
-        focus_window(sb, flow_handle)
-        if on_hokas():
-            return "hokas"
-        if on_shrinkme():
-            return "shrinkme"
-        # 在任务页上: 不在上面点, 直接回首页面
-        cur = ""
-        try:
-            cur = sb.get_current_url() or ""
-        except Exception:
-            pass
-        log(f"[{tag}] 点击后落在任务页 {cur}, 不在上面点, 回首页面")
-        if return_to_shrinkme(sb, flow_handle, main_handle, first_url, tag):
-            return "shrinkme"
-        return "lost"
-
-    # --- 阶段 A: 验证码(首页面上点 Continue, 最多 10 轮) ---
-    advanced = False
-    for cycle in range(1, 11):
-        if not on_shrinkme():
-            if not return_to_shrinkme(sb, flow_handle, main_handle, first_url, tag):
-                log(f"[{tag}] 验证码阶段: 回不到首页面")
-                return False
-        if not pass_turnstile(sb, flow_handle, main_handle, tag):
-            return False
-        ok = click_and_settle(
-            sb,
-            ['//button[contains(., "Click here to continue")]',
-             '//a[contains(., "Click here to continue")]',
-             '//*[normalize-space()="Click here to continue"]',
-             '//input[contains(@value, "Click here to continue")]',
-             'button:contains("Click here to continue")'],
-            flow_handle, main_handle, f"{tag}_step1_continue",
-            button_text="Click here to continue")
-        save_shot(sb, f"{tag}_after_step1")
-        if not ok:
-            log(f"[{tag}] 验证码阶段 Continue 点击失败")
-            return False
-        where = after_click_settle()
-        if where == "hokas":
-            log(f"[{tag}] 点击后已回 hokas.net")
-            return True
-        if where == "lost":
-            log(f"[{tag}] 验证码阶段: 点击后回不到首页面")
-            return False
-        # 回到首页面后看状态: 还在验证页就下一轮, 否则算推进
-        try:
-            still_captcha = sb.is_text_visible("Please check the captcha")
-        except Exception:
-            still_captcha = False
-        if not still_captcha:
-            advanced = True
-            log(f"[{tag}] 验证码阶段第 {cycle} 轮: 已离开验证页")
-            break
-        log(f"[{tag}] 验证码阶段第 {cycle} 轮后仍在验证页, 下一轮...")
-    if not advanced:
-        log(f"[{tag}] 验证码阶段 10 轮后仍未离开验证页")
+    if not ready:
+        log(f"[{tag}] 倒计时 90 秒仍未见可点 Get Link")
+        save_shot(sb, f"{tag}_getlink_not_ready")
         return False
-
-    # --- 阶段 B: 首页面步骤循环(只在首页面上点, 最多 10 轮) ---
-    for round_no in range(1, 11):
-        if not on_shrinkme():
-            if not return_to_shrinkme(sb, flow_handle, main_handle, first_url, tag):
-                log(f"[{tag}] 步骤循环: 回不到首页面")
-                return False
-        if on_hokas():
-            return True
-        if get_link_ready():
-            break
-        if in_countdown():
-            log(f"[{tag}] 步骤循环第 {round_no} 轮: 首页面倒计时中, 等 10 秒...")
-            sb.sleep(10)
-            continue
-        # 找首页面当前的操作按钮: 不依赖文字(工具条按钮优先),
-        # 再按 Continue/Next/Generate Link 文字找(只找 <button>, 不找 <a>——
-        # 文章页 <a> Continue 是分页陷阱; 这里本来就在首页面上,
-        # 仍只点 button, 防止点中页面里的文章链接)。
-        tb = _js_toolbar_button(sb, click=False)
-        log(f"[{tag}] 步骤循环第 {round_no} 轮: 首页面工具条按钮: {tb}")
-        clicked = False
-        if isinstance(tb, str) and tb.startswith("found:"):
-            tb2 = _js_toolbar_button(sb, click=True)
-            log(f"[{tag}] 步骤循环第 {round_no} 轮: 点工具条按钮: {tb2}")
-            clicked = isinstance(tb2, str) and tb2.startswith("clicked:")
-            if clicked:
-                sb.sleep(5)
-                close_extra_windows(sb, {flow_handle, main_handle})
-                focus_window(sb, flow_handle)
-        if not clicked:
-            ok = click_and_settle(
-                sb,
-                ['//button[contains(., "Continue")]',
-                 '//*[normalize-space()="Continue..."]',
-                 '//button[contains(., "Next")]',
-                 '//button[contains(., "Generate Link")]',
-                 '//input[contains(@value, "Continue")]'],
-                flow_handle, main_handle, f"{tag}_step_continue_r{round_no}",
-                button_text="Continue...")
-            clicked = ok
-            if clicked:
-                log(f"[{tag}] 步骤循环第 {round_no} 轮: 首页面 Continue 已点")
-        if not clicked:
-            log(f"[{tag}] 步骤循环第 {round_no} 轮: 首页面上无可点按钮, 停止"
-                f"(不在任务页上瞎点, 等人工看截图定下一步)")
-            save_shot(sb, f"{tag}_no_button_on_shrinkme")
-            return False
-        save_shot(sb, f"{tag}_after_step_r{round_no}")
-        where = after_click_settle()
-        if where == "hokas":
-            log(f"[{tag}] 步骤点击后已回 hokas.net")
-            return True
-        if where == "lost":
-            log(f"[{tag}] 步骤循环: 点击后回不到首页面")
-            return False
-        # 回到首页面, 下轮再看状态(Get Link/倒计时/新按钮)
-        log(f"[{tag}] 步骤循环第 {round_no} 轮结束, 已回首页面, 看下一步状态")
-    else:
-        log(f"[{tag}] 步骤循环 10 轮仍未见 Get Link")
-        return False
-
-    # --- 阶段 C: 点 Get Link(首页面上, 最多 4 次) ---
-    if not on_shrinkme():
-        if not return_to_shrinkme(sb, flow_handle, main_handle, first_url, tag):
-            return False
-    if not get_link_ready():
-        log(f"[{tag}] 进 Get Link 环节时首页面上无可点 Get Link")
-        return False
+    # 点 Get Link: popunder 会吞掉点击, 点完关广告回主窗口重点, 直到跳回 hokas
     for attempt in range(1, 5):
         focus_window(sb, flow_handle)
         try:
@@ -1893,8 +1929,8 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             log(f"[{tag}] 第 {attempt} 次点击 Get Link (点击前: {url_before} -> 点击后: {url_after})")
         except Exception as e:
             log(f"[{tag}] 点击 Get Link 异常: {e}")
-            js_res = _js_click_by_text(sb, "Get Link")
-            log(f"[{tag}] JS 兜底点 Get Link: {js_res}")
+            _click_overlay_button(sb, flow_handle, main_handle,
+                                  "Get Link", f"{tag}_getlink_js")
         sb.sleep(5)
         for h in list(sb.driver.window_handles):
             try:
@@ -2142,6 +2178,16 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
     if not is_clickable(el):
         log(f"[Add {hours} Hours] 按钮[{btn_text}]不可点击(6 小时冷却中)")
         return "unavailable"
+    # 冷却跳过: 面板会写 "12h option used - try again after 22:39
+    # (24h still available)"。已冷却的按钮不要走(走了也不到账, 白白
+    # 耗一次 shrinkme 流程)。Deborah 2026-11-04 手动续 12h 后, 12h
+    # 选项冷却到 22:39, 24h 仍可用, 因此下次跑应只走 Add 24 + Start。
+    try:
+        if sb.is_text_visible(f"{hours}h option used"):
+            log(f"[Add {hours} Hours] 面板显示该选项已用(冷却中), 跳过不走")
+            return "unavailable"
+    except Exception:
+        pass
     try:
         sb.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         sb.sleep(1)
