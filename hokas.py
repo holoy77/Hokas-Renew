@@ -37,19 +37,31 @@ hokas.net 免费服务器自动续期脚本
   PANEL_URL       面板地址, 默认 https://hokas.net
   SIGN_IN_URL     登录页地址, 默认 https://hokas.net/sign-in
   SERVER_NAME     服务器名(可选, 默认优先找 myappas, 找不到则点第一个服务器)
+  SERVER_ID       服务器 ID(可选, 如 b9275; 设置后优先按 ID 找卡片, 不怕名字拼错)
+  PROXY           代理(可选): http://user:pass@host:port 或 socks5://host:port
+                  可直接给浏览器; vless:// 链接会在 runner 上经 Xray 转成
+                  127.0.0.1:1081 的本地 HTTP 代理再给浏览器(浏览器不能直连 vless)
 
 已知风险: shrinkme 的 Cloudflare 对自动化浏览器很不友好, UC 模式也可能被重置。
 脚本对验证做了耐心等待 + 多次重试, 且每一步都截图, 失败时请先看 Artifacts 截图定位。
 """
 
+import atexit
 import email
 import email.utils
 import imaplib
+import json
 import os
 import re
+import shutil
+import socket
+import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
+import urllib.request
+import zipfile
 from datetime import datetime, timezone
 from email.header import decode_header
 
@@ -101,16 +113,151 @@ def log(msg):
 
 
 def proxy_label():
-    """代理的脱敏描述: 只显示协议和主机端口, 绝不包含账号密码。"""
+    """代理的脱敏描述: 只显示协议和主机端口, 绝不包含账号密码、
+    查询参数(SNI/路径等)和备注。教训(2026-11-04 run 41748751838):
+    旧版把 vless URI 的查询串也打进了日志, 暴露了节点主机/SNI。"""
     if not PROXY:
         return "未配置(直连)"
     try:
         rest = PROXY.split("://", 1)[1] if "://" in PROXY else PROXY
-        hostport = rest.split("@")[-1]
+        hostport = rest.split("@")[-1].split("?")[0].split("#")[0].split("/")[0]
         scheme = PROXY.split("://", 1)[0] if "://" in PROXY else "http"
         return f"已启用({scheme}://{hostport})"
     except Exception:
         return "已启用(地址已脱敏)"
+
+
+# ---------------- VLESS 节点转本地代理(Xray) ----------------
+# 浏览器不能直接用 vless:// 协议(2026-11-04 run 41748751838 在启动阶段
+# 就被 seleniumbase 的代理校验拒绝, 浏览器根本没起来)。
+# 做法: 在 runner 上起一个 Xray 进程, 把 VLESS 节点转成
+# 127.0.0.1:1081 的本地 HTTP 代理, 再把这个普通地址给浏览器。
+# 节点 UUID 只出现在 runner 本地的临时配置文件里, 绝不打日志。
+_xray_proc = None
+
+
+def _stop_xray():
+    global _xray_proc
+    try:
+        if _xray_proc is not None and _xray_proc.poll() is None:
+            _xray_proc.terminate()
+    except Exception:
+        pass
+
+
+def parse_vless_uri(uri):
+    """解析 vless://UUID@HOST:PORT?params, 返回节点 dict。
+    调用方绝不能把原始 URI 或 UUID 打进日志。"""
+    p = urllib.parse.urlparse(uri)
+    if p.scheme.lower() != "vless":
+        raise ValueError("不是 vless:// 链接")
+    uuid = p.username
+    host = p.hostname
+    port = p.port
+    if not uuid or not host or not port:
+        raise ValueError("vless 链接缺少 UUID/主机/端口")
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(p.query).items()}
+    return {
+        "uuid": uuid, "address": host, "port": port,
+        "security": (q.get("security") or "none").lower(),
+        "sni": q.get("sni") or q.get("serverName") or host,
+        "fp": q.get("fp") or "chrome",
+        "network": (q.get("type") or "tcp").lower(),
+        "ws_host": q.get("host") or host,
+        "ws_path": q.get("path") or "/",
+        "flow": q.get("flow") or "",
+        "pbk": q.get("pbk") or "",
+        "sid": q.get("sid") or "",
+        "service_name": q.get("serviceName") or "",
+    }
+
+
+def build_xray_config(node):
+    """由节点 dict 生成 Xray 配置 dict(纯函数, 便于单测)。"""
+    stream = {"network": node["network"]}
+    sec = node["security"]
+    if sec == "tls":
+        stream["security"] = "tls"
+        stream["tlsSettings"] = {"serverName": node["sni"],
+                                 "fingerprint": node["fp"]}
+    elif sec == "reality":
+        stream["security"] = "reality"
+        stream["realitySettings"] = {"serverName": node["sni"],
+                                     "publicKey": node["pbk"],
+                                     "shortId": node["sid"],
+                                     "fingerprint": node["fp"]}
+    if node["network"] == "ws":
+        stream["wsSettings"] = {"path": node["ws_path"],
+                                "headers": {"Host": node["ws_host"]}}
+    elif node["network"] == "grpc":
+        stream["grpcSettings"] = {"serviceName": node["service_name"]}
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {"port": 1080, "listen": "127.0.0.1", "protocol": "socks",
+             "settings": {"auth": "noauth", "udp": True}},
+            {"port": 1081, "listen": "127.0.0.1", "protocol": "http",
+             "settings": {}},
+        ],
+        "outbounds": [
+            {"protocol": "vless",
+             "settings": {"vnext": [{"address": node["address"],
+                                     "port": node["port"],
+                                     "users": [{"id": node["uuid"],
+                                                "encryption": "none",
+                                                "flow": node["flow"]}]}]},
+             "streamSettings": stream},
+        ],
+    }
+
+
+def ensure_xray():
+    """下载 Xray 内核到 /tmp/xray-bin(已存在则复用), 返回可执行路径。"""
+    bindir = "/tmp/xray-bin"
+    exe = os.path.join(bindir, "xray")
+    if os.path.isfile(exe) and os.access(exe, os.X_OK):
+        return exe
+    os.makedirs(bindir, exist_ok=True)
+    url = ("https://github.com/XTLS/Xray-core/releases/latest/download/"
+           "Xray-linux-64.zip")
+    zpath = os.path.join(bindir, "xray.zip")
+    log("正在下载 Xray 内核(用于 VLESS 转换)...")
+    req = urllib.request.Request(url, headers={"User-Agent": "hokas-renew"})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(zpath, "wb") as f:
+        shutil.copyfileobj(resp, f)
+    with zipfile.ZipFile(zpath) as z:
+        z.extract("xray", bindir)
+    os.chmod(exe, 0o755)
+    return exe
+
+
+def start_vless_proxy(uri):
+    """启动 Xray 把 VLESS 节点转成本地代理, 返回给浏览器的代理串。
+    任何一步失败都抛错, 调用方应在启动阶段退出, 不进登录。"""
+    global _xray_proc
+    node = parse_vless_uri(uri)
+    log("检测到 VLESS 节点, 正在启动 Xray 转成本地代理...")
+    xray = ensure_xray()
+    cfg_path = "/tmp/xray-config.json"
+    with open(cfg_path, "w") as f:
+        json.dump(build_xray_config(node), f)
+    os.chmod(cfg_path, 0o600)
+    _xray_proc = subprocess.Popen(
+        [xray, "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(_stop_xray)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", 1081), timeout=2):
+                log("VLESS 转换就绪: 本地代理 127.0.0.1:1081")
+                return "127.0.0.1:1081"
+        except OSError:
+            if _xray_proc.poll() is not None:
+                raise RuntimeError("Xray 进程已退出, VLESS 转换失败")
+            time.sleep(1)
+    _stop_xray()
+    raise RuntimeError("等待本地代理端口 1081 超时, VLESS 转换失败")
 
 
 def save_shot(sb, name):
@@ -1432,18 +1579,32 @@ def main():
 
     result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL}"]
     credited_any = False
-    stage = "login"
+    # 阶段变量: 只有阶段真正开始时才推进, 失败信息按它来报, 绝不能让
+    # 启动阶段的失败打印成登录失败、让登录失败打印成续期失败。
+    stage = "startup"
     # 浏览器会话: 配置了家宽代理就全程走代理(登录和 shrinkme 都用家宽 IP,
     # 更像真人); 未配置则直连。seleniumbase 的 proxy 参数支持带账号密码
     # 的代理, 认证由它内部处理。
     sb_kwargs = dict(uc=True, test=True, locale_code="en",
                      headless=False, xvfb=True)
-    if PROXY:
-        sb_kwargs["proxy"] = PROXY
     log(f"浏览器代理: {proxy_label()}")
+    # 代理处理(2026-11-04 run 41748751838 教训): vless 节点浏览器不能直接用,
+    # 在此转成本地代理; vmess/trojan/ss 等暂不支持, 明说后退出, 不启动浏览器、
+    # 不消耗任何登录尝试。
+    if PROXY:
+        _scheme = PROXY.split("://", 1)[0].lower() if "://" in PROXY else ""
+        if _scheme == "vless":
+            sb_kwargs["proxy"] = start_vless_proxy(PROXY)
+        elif _scheme in ("vmess", "trojan", "ss", "ssr"):
+            log(f"PROXY 格式错误: 当前值是 {_scheme} 协议节点, 暂不支持转换; "
+                "请换成 http/socks5 节点或 vless 节点, 本次不启动浏览器")
+            sys.exit(1)
+        else:
+            sb_kwargs["proxy"] = PROXY
     try:
         with SB(**sb_kwargs) as sb:
             try:
+                stage = "login"
                 do_login(sb)
                 stage = "overview"
                 open_server_overview(sb)
@@ -1500,7 +1661,9 @@ def main():
     except SystemExit:
         raise
     except Exception as e:
-        if stage == "login":
+        if stage == "startup":
+            log("启动阶段失败, 浏览器未启动, HOKAS 未产生任何登录或操作")
+        elif stage == "login":
             log("登录阶段失败, 本次未能进入续期流程(Add 按钮根本没被执行, "
                 "不是续期本身失败)")
         elif stage == "overview":
