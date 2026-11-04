@@ -1398,6 +1398,59 @@ def _js_click_by_text(sb, text):
         return f"js-error: {e}"
 
 
+def _js_toolbar_button(sb, click):
+    """在 shrinkme 工具条里找当前操作按钮, 不依赖按钮文字。
+    教训(run 41769447156): 按钮每回不一定叫 Continue(还可能叫 Next、
+    Generate Link...), 且文章正文里也可能有含 Continue 的链接——
+    按文字找会在第 2 轮后反复点中文章链接, URL 再也不动。
+    因此按容器定位: 含 ShrinkMe.io 标识的最小容器之父级即工具条,
+    在其中找第一个可见的非空按钮/链接(排除 logo 本身)。
+    click=True 时点它, 否则只返回是否找到。"""
+    do_click = "true" if click else "false"
+    js = (
+        "(function(){"
+        "function vis(el){"
+        "  if(!el) return false;"
+        "  try{ var r=el.getBoundingClientRect(); return r.width>0 && r.height>0; }"
+        "  catch(e){ return false; }"
+        "}"
+        "function walk(root,out){"
+        "  var els=root.querySelectorAll('*');"
+        "  for(var i=0;i<els.length;i++){"
+        "    var el=els[i];"
+        "    if(el.shadowRoot) walk(el.shadowRoot,out);"
+        "    out.push(el);"
+        "  }"
+        "}"
+        "var all=[]; walk(document,all);"
+        "var bar=null,best=1e9;"
+        "for(var i=0;i<all.length;i++){"
+        "  var t=(all[i].innerText||'').trim();"
+        "  if(t.indexOf('ShrinkMe.io')>=0 && t.length<best){ best=t.length; bar=all[i]; }"
+        "}"
+        "if(!bar) return 'no-toolbar';"
+        "var scopes=[]; var p=bar;"
+        "for(var s=0;s<3 && p;s++){ p=p.parentElement; if(p) scopes.push(p); }"
+        "for(var si=0;si<scopes.length;si++){"
+        "  var cands=scopes[si].querySelectorAll('button, a, input[type=button], input[type=submit]');"
+        "  for(var j=0;j<cands.length;j++){"
+        "    var c=cands[j];"
+        "    var ct=(c.innerText||c.value||'').trim();"
+        "    if(!vis(c)) continue;"
+        "    if(ct===''||ct==='ShrinkMe.io') continue;"
+        "    if(" + do_click + "){ c.scrollIntoView({block:'center'}); c.click(); return 'clicked:'+c.tagName+':'+ct; }"
+        "    return 'found:'+c.tagName+':'+ct;"
+        "  }"
+        "}"
+        "return 'no-button';"
+        "})()"
+    )
+    try:
+        return sb.execute_script(js)
+    except Exception as e:
+        return f"js-error: {e}"
+
+
 def _js_text_visible(sb, text):
     """用 JS 判断精确文本是否存在(穿透 shadow DOM, 容忍空白符差异)。
     只做存在性判断, 不点击, 供 Get Link 等待循环兜底。"""
@@ -1630,8 +1683,13 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
         clicked_once = False
         for round_no in range(1, 7):
             try:
+                tb_peek = _js_toolbar_button(sb, click=False)
+            except Exception:
+                tb_peek = ""
+            try:
                 scroll_hint = sb.is_text_visible("click Continue") \
-                    or _js_text_visible(sb, "Continue...")
+                    or _js_text_visible(sb, "Continue...") \
+                    or (isinstance(tb_peek, str) and tb_peek.startswith("found:"))
             except Exception:
                 scroll_hint = False
             if not scroll_hint:
@@ -1639,7 +1697,7 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
                     log(f"[{tag}] 滚到底提示已消失, 进入倒计时判断")
                 break
             saw_hint = True
-            log(f"[{tag}] 第 {round_no} 轮滚到底提示, 正在分段滚动页面...")
+            log(f"[{tag}] 第 {round_no} 轮滚到底提示(工具条按钮: {tb_peek}), 正在分段滚动页面...")
             focus_window(sb, flow_handle)
             try:
                 # 懒加载页面滚到底后高度还会变, 每步重读高度, 直到滚不动为止
@@ -1655,20 +1713,30 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             except Exception as e:
                 log(f"[{tag}] 滚动异常: {e}")
             sb.sleep(3)
-            ok2 = click_and_settle(
-                sb,
-                ['//button[contains(., "Continue")]',
-                 '//a[contains(., "Continue")]',
-                 '//*[normalize-space()="Continue..."]',
-                 '//input[contains(@value, "Continue")]'],
-                flow_handle, main_handle, f"{tag}_step2_scroll_continue_r{round_no}",
-                button_text="Continue...")
-            save_shot(sb, f"{tag}_after_scroll_continue_r{round_no}")
-            if ok2:
+            # 先按工具条定位点当前操作按钮(不依赖文字); 找不到再按 Continue 文字找
+            tb = _js_toolbar_button(sb, click=True)
+            log(f"[{tag}] 第 {round_no} 轮工具条按钮: {tb}")
+            if isinstance(tb, str) and tb.startswith("clicked:"):
                 clicked_once = True
-                log(f"[{tag}] 第 {round_no} 轮 Continue... 已点, 等待下一步")
+                log(f"[{tag}] 第 {round_no} 轮工具条按钮已点, 等待下一步")
+                sb.sleep(5)
+                close_extra_windows(sb, {flow_handle, main_handle})
+                focus_window(sb, flow_handle)
             else:
-                log(f"[{tag}] 第 {round_no} 轮 Continue... 未点上, 下轮重滚重试")
+                ok2 = click_and_settle(
+                    sb,
+                    ['//button[contains(., "Continue")]',
+                     '//a[contains(., "Continue")]',
+                     '//*[normalize-space()="Continue..."]',
+                     '//input[contains(@value, "Continue")]'],
+                    flow_handle, main_handle, f"{tag}_step2_scroll_continue_r{round_no}",
+                    button_text="Continue...")
+                if ok2:
+                    clicked_once = True
+                    log(f"[{tag}] 第 {round_no} 轮 Continue... 已点, 等待下一步")
+                else:
+                    log(f"[{tag}] 第 {round_no} 轮 Continue... 未点上, 下轮重滚重试")
+            save_shot(sb, f"{tag}_after_scroll_continue_r{round_no}")
             sb.sleep(3)
         if saw_hint and not clicked_once:
             log(f"[{tag}] 多轮 Continue... 均未点上")
@@ -1885,8 +1953,11 @@ def find_add_button(sb, hours):
     except Exception:
         pass
     # 全部找不到时留一份 DOM 证据, 下次不再靠猜。
+    # 注意: 必须包成 IIFE, 裸 return 在某些执行路径下会报 Illegal return statement
+    # (run 41769447156 的 DOM 证据就是这么采集失败的)。
     try:
         dump = sb.execute_script(
+            "(function(){"
             "var out = [];"
             "var els = document.querySelectorAll('*');"
             "for (var i = 0; i < els.length; i++) {"
@@ -1895,7 +1966,8 @@ def find_add_button(sb, hours):
             "    out.push(els[i].tagName + '|' + t);"
             "  }"
             "}"
-            "return out.slice(0, 20).join('; ');")
+            "return out.slice(0, 20).join('; ');"
+            "})()")
         log(f"[Add {hours} Hours] DOM 证据(文本含 Add 的元素): {dump}")
     except Exception as e:
         log(f"[Add {hours} Hours] DOM 证据采集失败: {e}")
