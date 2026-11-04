@@ -1406,10 +1406,24 @@ def _js_click_by_text(sb, text):
         "el.click();"
         "return 'clicked:' + el.tagName;"
     )
+    # Deborah 2026-11-04 要求: 每次点击按钮都要打印当前网址, 以确认
+    # 点击时所在的网址是不是需要点击的网址(一切主要活动都应在
+    # shrinkme.click 页面上进行)。因此 JS 点击成功时也打一条 URL。
     try:
-        return sb.execute_script(js)
+        url_before = sb.get_current_url() or ""
+    except Exception:
+        url_before = ""
+    try:
+        res = sb.execute_script(js)
     except Exception as e:
         return f"js-error: {e}"
+    if isinstance(res, str) and res.startswith("clicked:"):
+        try:
+            url_after = sb.get_current_url() or ""
+        except Exception:
+            url_after = ""
+        log(f"[JS 点击 {text}] 点击前 URL: {url_before} -> 点击后 URL: {url_after} ({res})")
+    return res
 
 
 def _js_toolbar_button(sb, click):
@@ -1458,6 +1472,15 @@ def _js_toolbar_button(sb, click):
         return f"js-error: {e}"
     if res is None:
         return "none-result"
+    # Deborah 2026-11-04 要求: 每次点击都打印当前网址。工具条点击成功时
+    # 把点击后的 URL 附在返回值里, 调用方的日志就会带上它(前缀 clicked:
+    # 不变, 调用方的 startswith 判断不受影响)。
+    if click and isinstance(res, str) and res.startswith("clicked:"):
+        try:
+            url = sb.get_current_url() or ""
+        except Exception:
+            url = ""
+        return f"{res} @ {url}"
     return res
 
 
@@ -1509,6 +1532,9 @@ def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3,
             log(f"[{tag}] flow 窗口已不存在, 停止点击")
             return clicked_any
         before_url = sb.get_current_url()
+        # Deborah 2026-11-04 要求: 每次点击按钮都打印当前网址, 以确认
+        # 点击时所在的网址是不是需要点击的网址。
+        log(f"[{tag}] 第 {attempt} 次点击前 URL: {before_url}")
         el = _find_button_selector(sb, selectors)
         frame_clicked = False
         if not el:
@@ -1543,6 +1569,7 @@ def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3,
             after_url = sb.get_current_url()
         except Exception:
             after_url = ""
+        log(f"[{tag}] 第 {attempt} 次点击后 URL: {after_url}")
         if after_url != before_url:
             log(f"[{tag}] 页面已跳转: {before_url} -> {after_url}")
             return True
@@ -1927,8 +1954,16 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     for attempt in range(1, 5):
         focus_window(sb, flow_handle)
         try:
+            url_before = sb.get_current_url() or ""
+        except Exception:
+            url_before = ""
+        try:
             sb.click(get_link_sel)
-            log(f"[{tag}] 第 {attempt} 次点击 Get Link")
+            try:
+                url_after = sb.get_current_url() or ""
+            except Exception:
+                url_after = ""
+            log(f"[{tag}] 第 {attempt} 次点击 Get Link (点击前: {url_before} -> 点击后: {url_after})")
         except Exception as e:
             log(f"[{tag}] 点击 Get Link 异常: {e}")
             js_res = _js_click_by_text(sb, "Get Link")
@@ -2185,7 +2220,11 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
         sb.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         sb.sleep(1)
         el.click()
-        log(f"[Add {hours} Hours] 已点击按钮[{btn_text}], 等待 shrinkme 新标签页...")
+        try:
+            cur_u = sb.get_current_url() or ""
+        except Exception:
+            cur_u = ""
+        log(f"[Add {hours} Hours] 已点击按钮[{btn_text}] (点击时 URL: {cur_u}), 等待 shrinkme 新标签页...")
     except Exception as e:
         log(f"[Add {hours} Hours] 点击失败: {e}")
         return "walk_failed"
@@ -2325,7 +2364,11 @@ def ensure_started(sb):
         sb.execute_script("arguments[0].scrollIntoView({block:'center'});", start_el)
         sb.sleep(1)
         start_el.click()
-        log(f"[Start] 已点击 Start 按钮[{btn_text}], 等待启动...")
+        try:
+            cur_u = sb.get_current_url() or ""
+        except Exception:
+            cur_u = ""
+        log(f"[Start] 已点击 Start 按钮[{btn_text}] (点击时 URL: {cur_u}), 等待启动...")
     except Exception as e:
         log(f"[Start] 点击 Start 失败: {e}")
         return "start_failed"
