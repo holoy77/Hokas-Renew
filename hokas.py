@@ -68,10 +68,19 @@ TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or "").strip()
 PANEL_URL = (os.environ.get("PANEL_URL") or "https://hokas.net").strip().rstrip("/")
 SIGN_IN_URL = (os.environ.get("SIGN_IN_URL") or "https://hokas.net/sign-in").strip()
 SERVER_NAME = (os.environ.get("SERVER_NAME") or "").strip()
+# 服务器 ID(卡片上显示的 ID, 如 b9275): 比名字更可靠, 因为名字拼写
+# 容易看错(如 jaosonserver 与 jasonserver)。设置后优先按 ID 找卡片。
+SERVER_ID = (os.environ.get("SERVER_ID") or "").strip()
 # Gmail 网页登录密码(未单独配置时复用 EMAIL_PASSWORD)
 GMAIL_PASSWORD = (os.environ.get("GMAIL_PASSWORD") or EMAIL_PASSWORD).strip()
 # 取码方式: auto / imap / web
 CODE_SOURCE = (os.environ.get("CODE_SOURCE") or "auto").strip().lower()
+# 家宽代理节点(可选, 由 GitHub Secrets 的 PROXY 注入):
+# 格式如 http://user:pass@host:port 或 socks5://user:pass@host:port。
+# GitHub 机房 IP 过 shrinkme/Cloudflare 容易被判机器人, 家宽 IP 更像真人。
+# 代理只作用于浏览器流量(HOKAS 登录 + shrinkme), IMAP 取码不走代理。
+# 注意: 该值含账号密码, 绝不能打印到日志, 只能打印脱敏后的协议+主机。
+PROXY = (os.environ.get("PROXY") or "").strip()
 
 SHOT_DIR = os.path.join(os.getcwd(), "screenshots")  # 关键步骤/失败截图目录
 _shot_counter = [0]
@@ -89,6 +98,19 @@ CODE_SUBJECT_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)\s+is your verification code"
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def proxy_label():
+    """代理的脱敏描述: 只显示协议和主机端口, 绝不包含账号密码。"""
+    if not PROXY:
+        return "未配置(直连)"
+    try:
+        rest = PROXY.split("://", 1)[1] if "://" in PROXY else PROXY
+        hostport = rest.split("@")[-1]
+        scheme = PROXY.split("://", 1)[0] if "://" in PROXY else "http"
+        return f"已启用({scheme}://{hostport})"
+    except Exception:
+        return "已启用(地址已脱敏)"
 
 
 def save_shot(sb, name):
@@ -935,6 +957,8 @@ def open_server_overview(sb):
     2026-11-04 run 41684794037 正是死在这里, 不是续期本身失败。
     """
     target = SERVER_NAME or "myappas"
+    # 找卡片的标识: 优先用服务器 ID(拼写无关), 其次用名字
+    ident = SERVER_ID or target
     # 1) 先关 Cookie 横幅, 免得遮挡左侧导航
     try:
         if sb.is_element_visible('//button[contains(., "Only necessary")]'):
@@ -942,25 +966,53 @@ def open_server_overview(sb):
             sb.sleep(1)
     except Exception:
         pass
-    # 2) 点左侧导航的 My Servers(精确文本), 而不是任何含 server 的链接
-    try:
-        sb.click('//a[normalize-space()="My Servers"]', timeout=10)
-        sb.sleep(3)
-    except Exception as e:
-        save_shot(sb, "error_no_my_servers")
-        raise RuntimeError(f"未能打开 My Servers 列表: {e}")
+    # 2) 点左侧导航的 My Servers(精确文本), 而不是任何含 server 的链接。
+    # 但登录后默认就已经落在服务器列表页(证据: run 41747780282 的截图,
+    # 面包屑就是 Dashboard > My Servers), 且侧栏 My Servers 是带下拉箭头
+    # 的分组、不是直链, 硬点会失败。因此先判断是否已在列表页, 是则跳过;
+    # 点导航失败时也再判断一次, 已在列表页就不算失败。
+    def _on_server_list():
+        try:
+            return (sb.is_text_visible("All your servers")
+                    or sb.is_text_visible("SLOTS USED"))
+        except Exception:
+            return False
+    if _on_server_list():
+        log("登录后已在服务器列表页, 跳过 My Servers 导航点击")
+    else:
+        try:
+            sb.click('//a[normalize-space()="My Servers"]', timeout=10)
+            sb.sleep(3)
+        except Exception:
+            if not _on_server_list():
+                save_shot(sb, "error_no_my_servers")
+                raise RuntimeError("未能打开 My Servers 列表(且当前页也不是列表页)")
+            log("导航点击失败, 但当前页已是服务器列表页, 继续")
     # 3) 在列表里点目标服务器卡片: 链接 href 含 /server 且卡片文本含服务器名
     clicked = False
-    for sel in (f'//a[contains(@href, "/server") and contains(., "{target}")]',
-                f'//*[contains(text(), "{target}")]/ancestor::a[1]'):
+    for sel in (f'//a[contains(@href, "/server") and contains(., "{ident}")]',
+                f'//*[contains(text(), "{ident}")]/ancestor::a[1]'):
         try:
             if sb.is_element_visible(sel):
                 sb.click(sel)
                 clicked = True
-                log(f"已点击服务器卡片: {target}")
+                log(f"已点击服务器卡片(标识: {ident}, 目标: {target})")
                 break
         except Exception:
             continue
+    if not clicked:
+        # 列表页兜底: 卡片上的 Manage 按钮。单服务器时可直接点唯一那个;
+        # 多服务器时不乱点, 宁可报错。
+        try:
+            manage_btns = sb.find_elements(
+                '//*[contains(., "Manage")][self::button or self::a]',
+                by="xpath")
+            if len(manage_btns) == 1:
+                manage_btns[0].click()
+                clicked = True
+                log(f"已点击唯一服务器的 Manage 按钮(目标: {target})")
+        except Exception:
+            pass
     if not clicked:
         save_shot(sb, "error_no_server_card")
         raise RuntimeError(f"My Servers 列表里未找到服务器 {target} 的卡片")
@@ -972,20 +1024,35 @@ def open_server_overview(sb):
             sb.sleep(4)
     except Exception:
         pass
-    # 5) 确保停在 Overview 标签
+    # 5) 确保停在 Overview 标签(优先点链接/标签形态的 Overview)
     try:
-        if sb.is_element_visible('//*[contains(text(), "Overview")]'):
+        if sb.is_element_visible('//a[contains(., "Overview")]'):
+            sb.click('//a[contains(., "Overview")]')
+            sb.sleep(3)
+        elif sb.is_element_visible('//*[contains(text(), "Overview")]'):
             sb.click('//*[contains(text(), "Overview")]')
             sb.sleep(3)
     except Exception:
         pass
-    # 6) 校验: 必须是服务器 Overview, 绝不能是 Deploy New Server 页
+    # 6) 校验: 必须是服务器 Overview, 绝不能是 Deploy New Server 页。
+    # 注意: 绝不能用整页 body 文本判 "Deploy New Server"——左侧导航栏
+    # 在每一页都含有这几个字, 那样连正确的 Overview 页也会被误判走偏。
+    # 因此只看主标题(h1/h2)和 URL 路径。
     try:
-        page = sb.get_text("body") or ""
         url = sb.get_current_url()
     except Exception:
-        page, url = "", ""
-    if "Deploy New Server" in page or "/new" in url:
+        url = ""
+    try:
+        headings = " ".join(
+            (e.text or "") for e in
+            sb.find_elements("//h1 | //h2", by="xpath"))
+    except Exception:
+        headings = ""
+    try:
+        page = sb.get_text("body") or ""
+    except Exception:
+        page = ""
+    if "Deploy New Server" in headings or "/new" in url or "deploy" in url:
         save_shot(sb, "error_wrong_page_deploy")
         raise RuntimeError(f"导航走偏: 停在了 Deploy New Server 页({url}), "
                            "未进入服务器 Overview, 拒绝继续读 Remaining")
@@ -1366,9 +1433,16 @@ def main():
     result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL}"]
     credited_any = False
     stage = "login"
+    # 浏览器会话: 配置了家宽代理就全程走代理(登录和 shrinkme 都用家宽 IP,
+    # 更像真人); 未配置则直连。seleniumbase 的 proxy 参数支持带账号密码
+    # 的代理, 认证由它内部处理。
+    sb_kwargs = dict(uc=True, test=True, locale_code="en",
+                     headless=False, xvfb=True)
+    if PROXY:
+        sb_kwargs["proxy"] = PROXY
+    log(f"浏览器代理: {proxy_label()}")
     try:
-        with SB(uc=True, test=True, locale_code="en",
-                headless=False, xvfb=True) as sb:
+        with SB(**sb_kwargs) as sb:
             try:
                 do_login(sb)
                 stage = "overview"
