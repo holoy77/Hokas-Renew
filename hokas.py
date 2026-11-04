@@ -1164,11 +1164,25 @@ def open_server_overview(sb):
         save_shot(sb, "error_no_server_card")
         raise RuntimeError(f"My Servers 列表里未找到服务器 {target} 的卡片")
     sb.sleep(5)
-    # Overview 判定: 面包屑含 "> Overview" 或出现 SERVER EXPIRING 面板。
+    # Overview 判定: URL 是 /dashboard/main/、或出现 SERVER EXPIRING/
+    # SERVER EXPIRED 面板、或面包屑含 "> Overview"。
     # 注意不能只看 body 含 "Overview"——Manage 页的侧栏里也有 Overview 链接。
+    # run 41780906387 的教训: URL 已是 /dashboard/main/，却因面板文案
+    # 从 SERVER EXPIRING 变成 SERVER EXPIRED 而被误判为不在 Overview，
+    # 程序自己刹车报错——URL 本身就是最硬的证据，必须先认它。
     def _on_overview_tab():
         try:
+            if "/dashboard/main/" in (sb.get_current_url() or ""):
+                return True
+        except Exception:
+            pass
+        try:
             if sb.is_text_visible("SERVER EXPIRING"):
+                return True
+        except Exception:
+            pass
+        try:
+            if sb.is_text_visible("SERVER EXPIRED"):
                 return True
         except Exception:
             pass
