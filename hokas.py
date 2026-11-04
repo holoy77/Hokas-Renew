@@ -1255,6 +1255,44 @@ def focus_window(sb, handle):
     return False
 
 
+def _find_button_selector(sb, selectors):
+    """在当前 DOM 里找第一个可见的目标按钮选择器。
+    按钮可能不是 <button>/<a>(如 div 模拟按钮或 input 提交按钮),
+    因此选择器表里应同时包含: button/a 的 contains、任意元素的精确文本、
+    input 的 value 匹配。run 41760381506 里 STEP 页的 CLICK TO VERIFY
+    按钮明明可见, 却因只查 button/a 而 3 次都没找到。"""
+    for sel in selectors:
+        try:
+            if sb.is_element_visible(sel):
+                return sel
+        except Exception:
+            continue
+    return None
+
+
+def _find_button_in_frames(sb, selectors):
+    """在各 iframe 里找目标按钮(中间页的验证条可能是 iframe 注入的)。
+    找到就切回默认内容并返回选择器, 找不到返回 None。"""
+    try:
+        frames = sb.find_elements("iframe")
+    except Exception:
+        return None
+    for frame in frames:
+        try:
+            sb.switch_to_frame(frame)
+            sel = _find_button_selector(sb, selectors)
+            if sel:
+                return sel
+        except Exception:
+            pass
+        finally:
+            try:
+                sb.switch_to_default_content()
+            except Exception:
+                pass
+    return None
+
+
 def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3):
     """
     在 flow 窗口(shrinkme/中间页)里点击目标按钮, 处理 popunder:
@@ -1267,14 +1305,9 @@ def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3):
             log(f"[{tag}] flow 窗口已不存在, 停止点击")
             return clicked_any
         before_url = sb.get_current_url()
-        el = None
-        for sel in selectors:
-            try:
-                if sb.is_element_visible(sel):
-                    el = sel
-                    break
-            except Exception:
-                continue
+        el = _find_button_selector(sb, selectors)
+        if not el:
+            el = _find_button_in_frames(sb, selectors)
         if not el:
             log(f"[{tag}] 第 {attempt} 次: 未找到可点击按钮")
             sb.sleep(3)
@@ -1380,6 +1413,8 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             sb,
             ['//button[contains(., "Click here to continue")]',
              '//a[contains(., "Click here to continue")]',
+             '//*[normalize-space()="Click here to continue"]',
+             '//input[contains(@value, "Click here to continue")]',
              'button:contains("Click here to continue")'],
             flow_handle, main_handle, f"{tag}_step1_continue")
         save_shot(sb, f"{tag}_after_step1")
@@ -1415,6 +1450,8 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             sb,
             ['//button[contains(., "CLICK TO VERIFY")]',
              '//a[contains(., "CLICK TO VERIFY")]',
+             '//*[normalize-space()="CLICK TO VERIFY"]',
+             '//input[contains(@value, "CLICK TO VERIFY")]',
              'button:contains("CLICK TO VERIFY")'],
             flow_handle, main_handle, f"{tag}_step2_verify")
         save_shot(sb, f"{tag}_after_step2")
@@ -1428,7 +1465,9 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
     focus_window(sb, flow_handle)
     deadline = time.time() + 120
     get_link_sel = ('//button[contains(., "Get Link")] | '
-                    '//a[contains(., "Get Link")]')
+                    '//a[contains(., "Get Link")] | '
+                    '//*[normalize-space()="Get Link"] | '
+                    '//input[contains(@value, "Get Link")]')
     ready = False
     while time.time() < deadline:
         close_extra_windows(sb, {flow_handle, main_handle})
@@ -1582,10 +1621,16 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
     except Exception:
         pass
     sb.sleep(5)
-    # 若刷新后不在 Overview, 重新进一次
+    # 若刷新后不在 Overview, 重新进一次。复查时当前窗可能已不是面板
+    # (如停在广告页), 先回面板首页再进 Overview, 否则导航点击必然失败。
     after_minutes, after_raw = get_remaining(sb)
     if after_minutes is None:
         try:
+            try:
+                sb.open(PANEL_URL)
+                sb.sleep(3)
+            except Exception:
+                pass
             open_server_overview(sb)
             after_minutes, after_raw = get_remaining(sb)
         except Exception as e:
