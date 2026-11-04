@@ -260,6 +260,93 @@ def start_vless_proxy(uri):
     raise RuntimeError("等待本地代理端口 1081 超时, VLESS 转换失败")
 
 
+def parse_hysteria2_uri(uri):
+    """解析 hysteria2://PASSWORD@HOST:PORT?params(别名 hy2://), 返回节点 dict。
+    hy2 的密码就是 userinfo 本身(无用户名); 若写成 user:password@ 形式,
+    则取冒号后的部分。常用参数: sni、obfs(=salamander)、obfs-password、
+    insecure(=1/true 时允许自签证书)。调用方绝不能把原始 URI 或密码打进日志。
+    注意: hy2 走 UDP/QUIC, 若 runner 出口禁 UDP 则连不上, 与配置无关。"""
+    p = urllib.parse.urlparse(uri)
+    if p.scheme.lower() not in ("hysteria2", "hy2"):
+        raise ValueError("不是 hysteria2:// 链接")
+    password = p.password or p.username
+    host = p.hostname
+    port = p.port
+    if not password or not host or not port:
+        raise ValueError("hysteria2 链接缺少密码/主机/端口")
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(p.query).items()}
+    insecure = (q.get("insecure") or "").lower() in ("1", "true", "yes")
+    return {
+        "password": password, "address": host, "port": port,
+        "sni": q.get("sni") or q.get("peer") or host,
+        "obfs": (q.get("obfs") or "").lower(),
+        "obfs_password": q.get("obfs-password") or q.get("obfs_password") or "",
+        "insecure": insecure,
+    }
+
+
+def build_xray_config_hysteria2(node):
+    """由 hy2 节点 dict 生成 Xray 配置 dict(纯函数, 便于单测)。
+    形状按新版 Xray-core 的 hysteria2 出站协议:
+    protocol=hysteria2, settings.servers[] 带 address/port/password,
+    obfs 在 server 内, TLS 在 streamSettings 里(alpn 必须是 h3)。
+    入站与 VLESS 版相同: 本地 socks 1080 + http 1081, 浏览器只连 1081。"""
+    server = {"address": node["address"], "port": node["port"],
+              "password": node["password"]}
+    if node["obfs"]:
+        server["obfs"] = {"type": node["obfs"],
+                          "password": node["obfs_password"]}
+    tls = {"serverName": node["sni"], "fingerprint": "chrome",
+           "alpn": ["h3"], "allowInsecure": bool(node["insecure"])}
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {"port": 1080, "listen": "127.0.0.1", "protocol": "socks",
+             "settings": {"auth": "noauth", "udp": True}},
+            {"port": 1081, "listen": "127.0.0.1", "protocol": "http",
+             "settings": {}},
+        ],
+        "outbounds": [
+            {"protocol": "hysteria2",
+             "settings": {"servers": [server]},
+             "streamSettings": {"network": "hysteria2", "security": "tls",
+                                "tlsSettings": tls}},
+        ],
+    }
+
+
+def start_hysteria2_proxy(uri):
+    """启动 Xray 把 hysteria2 节点转成本地代理, 返回给浏览器的代理串。
+    故意不复用 start_vless_proxy 的解析/配置(两者协议不同), 但启动与
+    等待端口的逻辑相同: 任何一步失败都抛错, 调用方应在启动阶段退出,
+    不进登录、不消耗验证码。若 Xray 因配置形状不对而退出, 这里会直接
+    报 “Xray 进程已退出”, 属于启动失败, 同样零成本。"""
+    global _xray_proc
+    node = parse_hysteria2_uri(uri)
+    log("检测到 hysteria2 节点, 正在启动 Xray 转成本地代理...")
+    xray = ensure_xray()
+    cfg_path = "/tmp/xray-config.json"
+    with open(cfg_path, "w") as f:
+        json.dump(build_xray_config_hysteria2(node), f)
+    os.chmod(cfg_path, 0o600)
+    _xray_proc = subprocess.Popen(
+        [xray, "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(_stop_xray)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", 1081), timeout=2):
+                log("hysteria2 转换就绪: 本地代理 127.0.0.1:1081")
+                return "127.0.0.1:1081"
+        except OSError:
+            if _xray_proc.poll() is not None:
+                raise RuntimeError("Xray 进程已退出, hysteria2 转换失败")
+            time.sleep(1)
+    _stop_xray()
+    raise RuntimeError("等待本地代理端口 1081 超时, hysteria2 转换失败")
+
+
 def save_shot(sb, name):
     """保存带序号的页面截图到 screenshots 目录(CI 中会作为 Artifact 上传)"""
     try:
@@ -2384,16 +2471,18 @@ def main():
     sb_kwargs = dict(uc=True, test=True, locale_code="en",
                      headless=False, xvfb=True)
     log(f"浏览器代理: {proxy_label()}")
-    # 代理处理(2026-11-04 run 41748751838 教训): vless 节点浏览器不能直接用,
-    # 在此转成本地代理; vmess/trojan/ss 等暂不支持, 明说后退出, 不启动浏览器、
-    # 不消耗任何登录尝试。
+    # 代理处理(2026-11-04 run 41748751838 教训): vless/hysteria2 节点浏览器
+    # 不能直接用, 在此经 Xray 转成本地代理; vmess/trojan/ss 等暂不支持,
+    # 明说后退出, 不启动浏览器、不消耗任何登录尝试。
     if PROXY:
         _scheme = PROXY.split("://", 1)[0].lower() if "://" in PROXY else ""
         if _scheme == "vless":
             sb_kwargs["proxy"] = start_vless_proxy(PROXY)
+        elif _scheme in ("hysteria2", "hy2"):
+            sb_kwargs["proxy"] = start_hysteria2_proxy(PROXY)
         elif _scheme in ("vmess", "trojan", "ss", "ssr"):
             log(f"PROXY 格式错误: 当前值是 {_scheme} 协议节点, 暂不支持转换; "
-                "请换成 http/socks5 节点或 vless 节点, 本次不启动浏览器")
+                "请换成 http/socks5 节点、vless 节点或 hysteria2 节点, 本次不启动浏览器")
             sys.exit(1)
         else:
             sb_kwargs["proxy"] = PROXY
