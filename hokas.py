@@ -1270,19 +1270,32 @@ def _find_button_selector(sb, selectors):
     return None
 
 
-def _find_button_in_frames(sb, selectors):
-    """在各 iframe 里找目标按钮(中间页的验证条可能是 iframe 注入的)。
-    找到就切回默认内容并返回选择器, 找不到返回 None。"""
+def _click_button_in_frames(sb, selectors, tag):
+    """在各 iframe 里找目标按钮并直接在该 frame 内点击。
+    必须在 frame 内点完再切回: 切回默认内容后原 frame 的元素引用就失效了,
+    先返回选择器再点必然失败。找不到返回 False。"""
     try:
         frames = sb.find_elements("iframe")
     except Exception:
-        return None
-    for frame in frames:
+        return False
+    if frames:
+        log(f"[{tag}] iframe 数量: {len(frames)}")
+    for idx, frame in enumerate(frames):
         try:
             sb.switch_to_frame(frame)
+        except Exception:
+            try:
+                sb.switch_to_frame(idx)
+            except Exception:
+                continue
+        try:
             sel = _find_button_selector(sb, selectors)
             if sel:
-                return sel
+                try:
+                    sb.click(sel)
+                    return True
+                except Exception:
+                    pass
         except Exception:
             pass
         finally:
@@ -1290,7 +1303,7 @@ def _find_button_in_frames(sb, selectors):
                 sb.switch_to_default_content()
             except Exception:
                 pass
-    return None
+    return False
 
 
 def _js_click_by_text(sb, text):
@@ -1300,25 +1313,35 @@ def _js_click_by_text(sb, text):
     文本用 json 转义后拼进 JS, 不经过 execute_script 的 arguments 参数
     (旧版曾因 arguments 未定义而崩过)。"""
     lit = json.dumps(text)
+    lit_up = json.dumps(text.upper())
     js = (
-        "var out = [];"
+        "var out = [], outCi = [];"
         "function walk(root) {"
         "  var els = root.querySelectorAll('*');"
         "  for (var i = 0; i < els.length; i++) {"
         "    var el = els[i];"
         "    if (el.shadowRoot) { walk(el.shadowRoot); }"
-        "    if ((el.innerText || '').trim() === " + lit + ") { out.push(el); }"
+        "    var t = (el.innerText || el.textContent || '').trim();"
+        "    if (t === " + lit + ") { out.push(el); }"
+        "    else if (t.toUpperCase() === " + lit_up + ") { outCi.push(el); }"
         "  }"
         "}"
-        "walk(document);"
-        "if (out.length === 0) { return 'not-found'; }"
+        "var docs = [document];"
+        "var frs = document.querySelectorAll('iframe');"
+        "for (var k = 0; k < frs.length; k++) {"
+        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
+        "  catch (e) {}"
+        "}"
+        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
+        "var cands = out.length > 0 ? out : outCi;"
+        "if (cands.length === 0) { return 'not-found'; }"
         "var el = null;"
-        "for (var j = 0; j < out.length; j++) {"
-        "  if (['BUTTON', 'A', 'INPUT'].indexOf(out[j].tagName) >= 0) {"
-        "    el = out[j]; break;"
+        "for (var j = 0; j < cands.length; j++) {"
+        "  if (['BUTTON', 'A', 'INPUT'].indexOf(cands[j].tagName) >= 0) {"
+        "    el = cands[j]; break;"
         "  }"
         "}"
-        "if (!el) { el = out[out.length - 1]; }"
+        "if (!el) { el = cands[cands.length - 1]; }"
         "el.scrollIntoView({block: 'center'});"
         "el.click();"
         "return 'clicked:' + el.tagName;"
@@ -1344,18 +1367,22 @@ def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3,
             return clicked_any
         before_url = sb.get_current_url()
         el = _find_button_selector(sb, selectors)
+        frame_clicked = False
         if not el:
-            el = _find_button_in_frames(sb, selectors)
+            frame_clicked = _click_button_in_frames(sb, selectors, tag)
         js_clicked = False
-        if not el and button_text:
+        if not el and not frame_clicked and button_text:
             js_res = _js_click_by_text(sb, button_text)
             log(f"[{tag}] JS 兜底找按钮({button_text}): {js_res}")
             js_clicked = isinstance(js_res, str) and js_res.startswith("clicked:")
-        if not el and not js_clicked:
+        if not el and not frame_clicked and not js_clicked:
             log(f"[{tag}] 第 {attempt} 次: 未找到可点击按钮")
             sb.sleep(3)
             continue
-        if js_clicked:
+        if frame_clicked:
+            clicked_any = True
+            log(f"[{tag}] 第 {attempt} 次 iframe 内点击成功")
+        elif js_clicked:
             clicked_any = True
             log(f"[{tag}] 第 {attempt} 次 JS 点击成功")
         else:
