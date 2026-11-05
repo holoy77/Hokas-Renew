@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 hokas.net 免费服务器自动续期脚本
-(首选 Cookie 登入，失败自动回退到邮箱+密码登入；带出口 IP 检测与 sing-box 转发)
+(全自动闭环版: Cookie优先 -> 账号密码登录 -> 遇异地两步验证自动 IMAP 读取 Gmail 验证码填入)
 """
 
 import atexit
+import email
+import email.utils
+import imaplib
 import json
 import os
 import re
@@ -18,15 +21,27 @@ import traceback
 import urllib.parse
 import urllib.request
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
+from email.header import decode_header
 
 import requests
 from seleniumbase import SB
 
 # ---------------- 配置 ----------------
 EMAIL = (os.environ.get("EMAIL") or "").strip()
-PASSWORD = (os.environ.get("PASSWORD") or os.environ.get("EMAIL_PASSWORD") or "").strip()
-# Cookie 环境变量 (支持 JSON 数组字符串或 key=value 字符串)
+# Hokas 网页登录密码 (优先读取 PASSWORD / GMAIL_PASSWORD)
+PASSWORD = (os.environ.get("PASSWORD") or os.environ.get("HOKAS_PASSWORD") or os.environ.get("GMAIL_PASSWORD") or "").strip()
+# Gmail IMAP 授权码 (Google 16 位应用专用密码，用于自动读验证码)
+IMAP_PASSWORD = (os.environ.get("IMAP_PASSWORD") or os.environ.get("EMAIL_PASSWORD") or "").strip()
+
+# 如果 PASSWORD 仍为空，且 IMAP_PASSWORD 看起来像普通密码，则兜底兼容
+if not PASSWORD and IMAP_PASSWORD:
+    PASSWORD = IMAP_PASSWORD
+
+IMAP_SERVER = (os.environ.get("IMAP_SERVER") or "imap.gmail.com").strip()
+IMAP_PORT = int(os.environ.get("IMAP_PORT") or "993")
+
+# Cookie 环境变量
 COOKIES_ENV = (os.environ.get("COOKIES") or os.environ.get("HOKAS_COOKIES") or "").strip()
 
 TG_BOT_TOKEN = (os.environ.get("TG_BOT_TOKEN") or "").strip()
@@ -42,6 +57,9 @@ PROXY_CORE = (os.environ.get("PROXY_CORE") or "sing-box").strip().lower()
 
 SHOT_DIR = os.path.join(os.getcwd(), "screenshots")
 _shot_counter = [0]
+
+CODE_MAX_RETRIES = 6      # IMAP 轮询次数
+CODE_POLL_INTERVAL = 8    # 轮询间隔 (秒)
 
 
 def log(msg):
@@ -412,9 +430,207 @@ def send_tg(text):
         log(f"TG 通知异常: {e}")
 
 
+# ---------------- IMAP 邮件读取验证码 ----------------
+def _decode(value):
+    if not value:
+        return ""
+    parts = decode_header(value)
+    out = ""
+    for data, charset in parts:
+        if isinstance(data, bytes):
+            out += data.decode(charset or "utf-8", errors="ignore")
+        else:
+            out += str(data)
+    return out
+
+
+def _mail_body(msg):
+    texts = []
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            if ctype in ("text/plain", "text/html"):
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    texts.append(payload.decode(charset, errors="ignore"))
+    else:
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            texts.append(payload.decode(charset, errors="ignore"))
+    return "\n".join(texts)
+
+
+def _mail_matches(sender, subject):
+    s = subject.lower()
+    snd = sender.lower()
+    return ("hokas" in snd or "clerk" in snd or "hokas" in s
+            or "verification" in s or "verify" in s or "验证码" in s or "code" in s)
+
+
+def _scan_folder(box, folder, after_ts):
+    status, _ = box.select(folder, readonly=True)
+    if status != "OK":
+        return None
+    since = datetime.now(timezone.utc).strftime("%d-%b-%Y")
+    status, data = box.search(None, f'(SINCE "{since}")')
+    if status != "OK":
+        return None
+    ids = data[0].split()
+    for mail_id in reversed(ids[-20:]):
+        status, msg_data = box.fetch(mail_id, "(RFC822)")
+        if status != "OK":
+            continue
+        msg = email.message_from_bytes(msg_data[0][1])
+        subject = _decode(msg.get("Subject", ""))
+        sender = _decode(msg.get("From", ""))
+        date_hdr = msg.get("Date", "")
+        if not _mail_matches(sender, subject):
+            continue
+        if date_hdr:
+            try:
+                mail_ts = email.utils.parsedate_to_datetime(date_hdr).timestamp()
+                if mail_ts < after_ts - 120:
+                    continue
+            except Exception:
+                pass
+        content = subject + "\n" + _mail_body(msg)
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", content)
+        if m:
+            log(f"从[{folder}]邮件[{subject}]提取到 6 位验证码: {m.group(1)}")
+            return m.group(1)
+    return None
+
+
+def fetch_verification_code(after_ts):
+    if not IMAP_PASSWORD:
+        raise RuntimeError("未配置 IMAP 授权码 (EMAIL_PASSWORD)，无法自动收信取验证码")
+    folders = ["INBOX"]
+    if "gmail" in IMAP_SERVER:
+        folders += ['"[Gmail]/Spam"', '"[Gmail]/All Mail"']
+    
+    clean_pass = IMAP_PASSWORD.replace(" ", "")
+    for attempt in range(1, CODE_MAX_RETRIES + 1):
+        log(f"第 {attempt}/{CODE_MAX_RETRIES} 次尝试从邮箱读取验证码...")
+        try:
+            box = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+            box.login(EMAIL, clean_pass)
+            code = None
+            for folder in folders:
+                try:
+                    code = _scan_folder(box, folder, after_ts)
+                except Exception:
+                    pass
+                if code:
+                    break
+            box.logout()
+            if code:
+                return code
+        except Exception as e:
+            log(f"读取邮箱连接异常: {e}")
+        if attempt < CODE_MAX_RETRIES:
+            time.sleep(CODE_POLL_INTERVAL)
+    raise TimeoutError(f"尝试 {CODE_MAX_RETRIES} 次仍未在邮箱中读取到最新验证码")
+
+
+# ---------------- 验证码输入框处理 ----------------
+def find_otp_inputs(sb):
+    selectors = (
+        'input[data-otp-input]', 'input[autocomplete="one-time-code"]',
+        'input[name^="codeInput"]', 'input[inputmode="numeric"]',
+        'input[maxlength="1"]', 'input[name="code"]', 'input[id*="code"]',
+        'input[id*="otp"]', 'input[data-testid*="otp"]', 'input[data-testid*="code"]'
+    )
+    for sel in selectors:
+        try:
+            els = [e for e in sb.find_elements(sel) if e.is_displayed()]
+            if els:
+                return els
+        except Exception:
+            continue
+    try:
+        all_inputs = [e for e in sb.find_elements("input") if e.is_displayed()]
+        singles = [e for e in all_inputs if e.get_attribute("maxlength") == "1" or (e.get_attribute("inputmode") or "").lower() == "numeric"]
+        if len(singles) >= 6 or len(singles) == 1:
+            return singles
+    except Exception:
+        pass
+    return []
+
+
+def is_otp_page(sb):
+    try:
+        url = sb.get_current_url() or ""
+        if "factor-one" in url or "factor-two" in url:
+            return True
+        if sb.is_text_visible("Check your email") or sb.is_text_visible("Enter verification code") or sb.is_text_visible("输入验证码"):
+            return True
+        if len(find_otp_inputs(sb)) > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def js_fill_code(sb, code):
+    if not (isinstance(code, str) and code.isdigit() and len(code) == 6):
+        return 0, ""
+    script = """
+    function setVal(el, v) {
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(el, v);
+        el.dispatchEvent(new Event('input', {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+    const code = "%s";
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const otp = inputs.filter(el =>
+        el.autocomplete === 'one-time-code' || el.inputMode === 'numeric' ||
+        /code|otp/i.test(el.name || '') || /code|otp/i.test(el.id || ''));
+    if (otp.length === 1) {
+        setVal(otp[0], code);
+        return {n: 1, val: otp[0].value};
+    }
+    if (otp.length >= 6) {
+        otp.slice(0, 6).forEach((el, i) => setVal(el, code[i]));
+        return {n: 6, val: otp.slice(0, 6).map(el => el.value).join('')};
+    }
+    return {n: 0, val: ''};
+    """ % code
+    try:
+        res = sb.execute_script(script)
+        if isinstance(res, dict):
+            return int(res.get("n") or 0), (res.get("val") or "")
+        return 0, ""
+    except Exception:
+        return 0, ""
+
+
+def fill_otp_code(sb, code):
+    log(f"正在填入验证码: {code}")
+    n, val = js_fill_code(sb, code)
+    if n > 0 and val == code:
+        log("JS 原生注入验证码成功")
+        save_shot(sb, "code_filled")
+        return
+
+    els = find_otp_inputs(sb)
+    if not els:
+        raise RuntimeError("未定位到验证码输入框")
+    try:
+        els[0].click()
+        for ch in code:
+            els[0].send_keys(ch)
+            sb.sleep(0.3)
+    except Exception:
+        pass
+    sb.sleep(1)
+    save_shot(sb, "code_filled")
+
+
 # ---------------- Cookie 解析与加载 ----------------
 def load_cookies_data():
-    """从环境变量或本地 hokas.net_cookies.json 读取 Cookie 列表"""
     raw = COOKIES_ENV
     if not raw and os.path.isfile("hokas.net_cookies.json"):
         try:
@@ -427,7 +643,6 @@ def load_cookies_data():
     if not raw:
         return []
 
-    # 尝试按 JSON 解析
     try:
         data = json.loads(raw)
         if isinstance(data, list):
@@ -435,7 +650,6 @@ def load_cookies_data():
     except Exception:
         pass
 
-    # 兼容分号分隔的字符串格式: a=b; c=d
     cookies = []
     for item in raw.split(";"):
         item = item.strip()
@@ -446,15 +660,12 @@ def load_cookies_data():
 
 
 def try_cookie_login(sb):
-    """尝试通过 Cookie 直接登录"""
     cookies = load_cookies_data()
     if not cookies:
-        log("未找到可用 Cookie 配置，跳过 Cookie 登录")
         return False
 
     log(f"检测到 {len(cookies)} 个 Cookie，正在尝试 Cookie 免密登入...")
     try:
-        # 先打开面板建立域名上下文
         sb.uc_open_with_reconnect(PANEL_URL, reconnect_time=4)
         sb.sleep(2)
 
@@ -469,7 +680,6 @@ def try_cookie_login(sb):
                 "value": str(value),
                 "path": str(c.get("path") or "/"),
             }
-            # 域限定处理
             dom = c.get("domain") or ""
             if "hokas.net" in dom:
                 c_dict["domain"] = dom
@@ -507,7 +717,7 @@ def try_cookie_login(sb):
         return False
 
 
-# ---------------- 邮箱密码交互与登录 ----------------
+# ---------------- 表单交互与登录 ----------------
 def find_email_input(sb):
     for sel in (
         'input[name="identifier"]',
@@ -578,28 +788,13 @@ def page_has_servers(sb):
         return False
 
 
-def check_login_page_errors(sb):
-    try:
-        errors = sb.execute_script("""
-            var errs = [];
-            var els = document.querySelectorAll('.cl-formFieldErrorText, [role="alert"], .cl-alertText, p[id*="error"]');
-            els.forEach(el => {
-                var t = (el.innerText || el.textContent || '').trim();
-                if (t) errs.push(t);
-            });
-            return errs.join(' | ');
-        """)
-        if errors:
-            log(f"⚠️ 页面报错信息: {errors}")
-        body_text = sb.get_text("body") or ""
-        if "Check your email" in body_text or "verification code" in body_text.lower():
-            log("⚠️ 检测到页面要求输入【邮箱验证码】(Clerk 触发了异地二次验证)")
-    except Exception:
-        pass
+def do_login(sb):
+    # 1. 优先尝试 Cookie 免密登录
+    if try_cookie_login(sb):
+        return
 
-
-def do_password_login(sb):
-    log(f"开始邮箱密码登录流程，打开登录页: {SIGN_IN_URL}")
+    # 2. 账号密码登录流程
+    log(f"开始账号密码登录流程，打开登录页: {SIGN_IN_URL}")
     sb.uc_open_with_reconnect(SIGN_IN_URL, reconnect_time=6)
 
     log("登入页面等待 3 秒...")
@@ -630,18 +825,21 @@ def do_password_login(sb):
         sb.type(email_sel, EMAIL)
         sb.sleep(1)
 
-    # 若尚未渲染密码框，点击 Continue 进入密码页
+    # 若未同屏显示密码框，点击 Continue
     if not pass_sel:
         save_shot(sb, "filled_email")
-        log("点击 Continue 进入密码输入步...")
+        log("点击 Continue 进入下一步...")
+        request_ts = time.time()
         click_continue(sb)
         sb.sleep(3)
 
-        p_deadline = time.time() + 20
+        # 检查是否要求输入密码
+        p_deadline = time.time() + 15
         while time.time() < p_deadline:
             pass_sel = find_password_input(sb)
-            if pass_sel:
+            if pass_sel or is_otp_page(sb):
                 break
+            # 兼容切换密码选项
             for pwd_opt in (
                 '//button[contains(., "password") or contains(., "Password")]',
                 '//a[contains(., "password") or contains(., "Password")]',
@@ -656,53 +854,60 @@ def do_password_login(sb):
                     pass
             sb.sleep(2)
 
-    if not pass_sel:
-        check_login_page_errors(sb)
-        save_shot(sb, "error_no_password")
-        raise RuntimeError("未能加载到密码输入框，请查看截图")
+    # 如果有密码输入框，输入密码并提交
+    if pass_sel:
+        log(f"输入登录密码 (密码长度: {len(PASSWORD)} 位)...")
+        sb.type(pass_sel, PASSWORD)
+        sb.sleep(1)
+        save_shot(sb, "filled_password")
+        request_ts = time.time()
+        log("点击 Continue 提交密码...")
+        click_continue(sb)
+        sb.sleep(5)
+    else:
+        request_ts = time.time()
 
-    log(f"输入登录密码 (密码长度: {len(PASSWORD)} 位)...")
-    sb.type(pass_sel, PASSWORD)
-    sb.sleep(1)
-    save_shot(sb, "filled_password")
+    # 3. 检测是否进入了验证码流程 (异地风控或直接发码)
+    log("检查是否触发二次验证码或直接进入面板...")
+    for _ in range(8):
+        if page_has_servers(sb):
+            log(f"登录成功，直接进入服务器列表！当前网址: {sb.get_current_url()}")
+            save_shot(sb, "logged_in")
+            return
+        if is_otp_page(sb):
+            break
+        sb.sleep(2)
 
-    log("点击 Continue 提交登录...")
-    click_continue(sb)
-    sb.sleep(5)
+    if is_otp_page(sb):
+        log("⚠️ 检测到页面要求输入【邮箱验证码】(Clerk 触发了异地两步验证)")
+        save_shot(sb, "otp_required")
+        # 自动通过 IMAP 从 Gmail 收取验证码
+        code = fetch_verification_code(request_ts)
+        fill_otp_code(sb, code)
+        log("点击 Continue 提交验证码...")
+        click_continue(sb)
+        sb.sleep(5)
 
+    # 4. 等待进入服务器后台
     log("等待进入服务器面板...")
-    for i in range(25):
+    for _ in range(25):
         if page_has_servers(sb):
             log(f"登录成功，已进入服务器列表！当前网址: {sb.get_current_url()}")
             save_shot(sb, "logged_in")
             return
-        if i % 5 == 0:
-            check_login_page_errors(sb)
         sb.sleep(2)
 
-    check_login_page_errors(sb)
     save_shot(sb, "error_login_timeout")
     raise RuntimeError(f"登录提交后未能进入服务器面板，当前停留在: {sb.get_current_url()}")
 
 
-def do_login(sb):
-    # 1. 首选 Cookie 登录
-    if try_cookie_login(sb):
-        return
-
-    # 2. 回退到账号密码登录
-    do_password_login(sb)
-
-
 # ---------------- 出口 IP 探测 ----------------
 def check_egress_ip(sb):
-    """通过浏览器访问 ipify 查看实际出口 IP，验证代理是否生效"""
     try:
-        sb.open("https://api.ipify.org?format=json")
+        sb.open("https://api.ipify.org")
         sb.sleep(2)
-        txt = sb.get_text("body")
-        data = json.loads(txt)
-        log(f"🌐 浏览器实际出口 IP: {data.get('ip')}")
+        txt = (sb.get_text("body") or "").strip()
+        log(f"🌐 浏览器实际出口 IP: {txt}")
     except Exception as e:
         log(f"出口 IP 检测略过: {e}")
 
