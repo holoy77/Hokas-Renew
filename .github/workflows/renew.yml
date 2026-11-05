@@ -1,14 +1,13 @@
 name: Hokas 自动续期
 
 on:
-  # 定时已暂停(2026-11-04): 首跑登录问题未彻底验证前, 不让失败的运行
-  # 每 6 小时自动撞一次登录风控。首跑成功确认到账后, 再取消下面两行注释
-  # 恢复定时:
+  # 定时已暂停(2026-11-04): 确认手动触发运行成功且到账后，
+  # 再取消下面两行的注释恢复每 6 小时自动续期:
   # schedule:
   #   - cron: "15 */6 * * *"
   workflow_dispatch:
 
-# 同一时间只跑一个续期任务, 避免重复点击 Add 按钮互相干扰
+# 同一时间只跑一个续期任务，避免重复点击 Add 按钮互相冲突
 concurrency:
   group: hokas-renew
   cancel-in-progress: false
@@ -30,29 +29,29 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y xvfb
-          pip install -r requirements.txt
-          pip install seleniumbase
+          pip install requests seleniumbase
+          [ -f requirements.txt ] && pip install -r requirements.txt || true
           seleniumbase install chromedriver || true
 
       - name: Run renew script
         env:
           EMAIL: ${{ secrets.EMAIL }}
+          # 支持配置 PASSWORD 或继续复用 EMAIL_PASSWORD (填入网页端登录密码)
+          PASSWORD: ${{ secrets.PASSWORD || secrets.EMAIL_PASSWORD }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
-          CODE_SOURCE: ${{ secrets.CODE_SOURCE }}
-          IMAP_SERVER: ${{ secrets.IMAP_SERVER }}
-          IMAP_PORT: ${{ secrets.IMAP_PORT }}
+          # 代理节点配置 (支持 http, socks5, vless, hysteria2/hy2, trojan, ss)
+          PROXY: ${{ secrets.PROXY }}
+          # 代理转换内核 (默认 sing-box，可选 xray)
+          PROXY_CORE: ${{ secrets.PROXY_CORE }}
+          # 服务器指定 (可选)
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+          SERVER_NAME: ${{ secrets.SERVER_NAME }}
+          # Telegram 通知 (可选)
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 面板与登录地址 (可选，脚本内已有默认值)
           PANEL_URL: ${{ secrets.PANEL_URL }}
           SIGN_IN_URL: ${{ secrets.SIGN_IN_URL }}
-          SERVER_NAME: ${{ secrets.SERVER_NAME }}
-          # 服务器 ID(可选, 如 b9275): 设置后优先按 ID 找卡片, 不怕名字拼错。
-          SERVER_ID: ${{ secrets.SERVER_ID }}
-          # 家宽代理节点(可选): 直连过不了 shrinkme 验证时, 配了它就走家宽 IP。
-          # 在仓库 Settings -> Secrets 里新建名为 PROXY 的 Secret, 值形如
-          # http://user:pass@host:port 或 socks5://user:pass@host:port。
-          PROXY: ${{ secrets.PROXY }}
         run: |
           set -o pipefail
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 hokas.py 2>&1 | tee log.txt
@@ -71,6 +70,6 @@ jobs:
         run: |
           echo "## Hokas 自动续期运行日志" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cat log.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "log.txt 不存在" >> "$GITHUB_STEP_SUMMARY"
+          cat log.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null \vert{}\vert{} echo "log.txt 不存在" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "截图见本次运行的 Artifacts: screenshots" >> "$GITHUB_STEP_SUMMARY"
