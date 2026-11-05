@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 hokas.net 免费服务器自动续期脚本
-(支持邮箱 + 密码登入: 自动兼容同屏输入与分步输入模式)
+(首选 Cookie 登入，失败自动回退到邮箱+密码登入；带出口 IP 检测与 sing-box 转发)
 """
 
 import atexit
@@ -25,8 +25,9 @@ from seleniumbase import SB
 
 # ---------------- 配置 ----------------
 EMAIL = (os.environ.get("EMAIL") or "").strip()
-# 优先读取 PASSWORD，未设置时兼容 EMAIL_PASSWORD
 PASSWORD = (os.environ.get("PASSWORD") or os.environ.get("EMAIL_PASSWORD") or "").strip()
+# Cookie 环境变量 (支持 JSON 数组字符串或 key=value 字符串)
+COOKIES_ENV = (os.environ.get("COOKIES") or os.environ.get("HOKAS_COOKIES") or "").strip()
 
 TG_BOT_TOKEN = (os.environ.get("TG_BOT_TOKEN") or "").strip()
 TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or "").strip()
@@ -35,7 +36,7 @@ SIGN_IN_URL = (os.environ.get("SIGN_IN_URL") or "https://hokas.net/sign-in").str
 SERVER_NAME = (os.environ.get("SERVER_NAME") or "").strip()
 SERVER_ID = (os.environ.get("SERVER_ID") or "").strip()
 
-# 代理配置 (支持 http, socks5, vless, hysteria2/hy2, trojan, ss)
+# 代理配置
 PROXY = (os.environ.get("PROXY") or "").strip()
 PROXY_CORE = (os.environ.get("PROXY_CORE") or "sing-box").strip().lower()
 
@@ -411,18 +412,102 @@ def send_tg(text):
         log(f"TG 通知异常: {e}")
 
 
-# ---------------- 表单交互与登录 ----------------
-def dump_inputs(sb):
-    """打印页面所有 input 元素属性，便于排查定位器"""
+# ---------------- Cookie 解析与加载 ----------------
+def load_cookies_data():
+    """从环境变量或本地 hokas.net_cookies.json 读取 Cookie 列表"""
+    raw = COOKIES_ENV
+    if not raw and os.path.isfile("hokas.net_cookies.json"):
+        try:
+            with open("hokas.net_cookies.json", "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                log("已找到本地 hokas.net_cookies.json 文件")
+        except Exception as e:
+            log(f"读取本地 cookies 文件失败: {e}")
+
+    if not raw:
+        return []
+
+    # 尝试按 JSON 解析
     try:
-        info = sb.execute_script(
-            "return Array.from(document.querySelectorAll('input')).map(el => "
-            "({type: el.type, name: el.name, id: el.id, placeholder: el.placeholder, vis: !!(el.offsetWidth || el.offsetHeight)}))")
-        log(f"当前页面 input 清单: {info}")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
     except Exception:
         pass
 
+    # 兼容分号分隔的字符串格式: a=b; c=d
+    cookies = []
+    for item in raw.split(";"):
+        item = item.strip()
+        if "=" in item:
+            k, v = item.split("=", 1)
+            cookies.append({"name": k.strip(), "value": v.strip(), "domain": ".hokas.net", "path": "/"})
+    return cookies
 
+
+def try_cookie_login(sb):
+    """尝试通过 Cookie 直接登录"""
+    cookies = load_cookies_data()
+    if not cookies:
+        log("未找到可用 Cookie 配置，跳过 Cookie 登录")
+        return False
+
+    log(f"检测到 {len(cookies)} 个 Cookie，正在尝试 Cookie 免密登入...")
+    try:
+        # 先打开面板建立域名上下文
+        sb.uc_open_with_reconnect(PANEL_URL, reconnect_time=4)
+        sb.sleep(2)
+
+        for c in cookies:
+            name = c.get("name")
+            value = c.get("value")
+            if not name or value is None:
+                continue
+
+            c_dict = {
+                "name": str(name),
+                "value": str(value),
+                "path": str(c.get("path") or "/"),
+            }
+            # 域限定处理
+            dom = c.get("domain") or ""
+            if "hokas.net" in dom:
+                c_dict["domain"] = dom
+            if "secure" in c:
+                c_dict["secure"] = bool(c["secure"])
+            if "httpOnly" in c:
+                c_dict["httpOnly"] = bool(c["httpOnly"])
+
+            same_site = c.get("sameSite")
+            if same_site in ("Strict", "Lax", "None"):
+                c_dict["sameSite"] = same_site
+
+            try:
+                sb.driver.add_cookie(c_dict)
+            except Exception:
+                try:
+                    c_dict.pop("domain", None)
+                    sb.driver.add_cookie(c_dict)
+                except Exception:
+                    pass
+
+        log("Cookie 植入完成，正在刷新页面验证身份...")
+        sb.open(PANEL_URL)
+        sb.sleep(4)
+
+        if page_has_servers(sb):
+            log("🎉 Cookie 登录成功！直接进入面板")
+            save_shot(sb, "cookie_login_success")
+            return True
+        else:
+            log("Cookie 未能直接生效，回退至账号密码登录...")
+            return False
+    except Exception as e:
+        log(f"Cookie 登录过程异常: {e}")
+        return False
+
+
+# ---------------- 邮箱密码交互与登录 ----------------
 def find_email_input(sb):
     for sel in (
         'input[name="identifier"]',
@@ -471,7 +556,6 @@ def click_continue(sb):
                 return True
         except Exception:
             continue
-    # 兜底回车提交
     try:
         sb.send_keys('input:focus', "\n")
         return True
@@ -482,9 +566,11 @@ def click_continue(sb):
 
 def page_has_servers(sb):
     try:
-        url = sb.get_current_url()
-        if "sign-in" in url or "factor-one" in url:
+        url = sb.get_current_url() or ""
+        if "sign-in" in url or "factor-one" in url or "factor-two" in url:
             return False
+        if "/dashboard" in url or "/server" in url:
+            return True
         return (sb.is_text_visible("My Servers") or sb.is_text_visible("Your Servers")
                 or (SERVER_NAME and sb.is_text_visible(SERVER_NAME))
                 or sb.is_text_visible("myappas") or sb.is_text_visible("Dashboard"))
@@ -492,11 +578,30 @@ def page_has_servers(sb):
         return False
 
 
-def do_login(sb):
-    log(f"打开登录页: {SIGN_IN_URL}")
+def check_login_page_errors(sb):
+    try:
+        errors = sb.execute_script("""
+            var errs = [];
+            var els = document.querySelectorAll('.cl-formFieldErrorText, [role="alert"], .cl-alertText, p[id*="error"]');
+            els.forEach(el => {
+                var t = (el.innerText || el.textContent || '').trim();
+                if (t) errs.push(t);
+            });
+            return errs.join(' | ');
+        """)
+        if errors:
+            log(f"⚠️ 页面报错信息: {errors}")
+        body_text = sb.get_text("body") or ""
+        if "Check your email" in body_text or "verification code" in body_text.lower():
+            log("⚠️ 检测到页面要求输入【邮箱验证码】(Clerk 触发了异地二次验证)")
+    except Exception:
+        pass
+
+
+def do_password_login(sb):
+    log(f"开始邮箱密码登录流程，打开登录页: {SIGN_IN_URL}")
     sb.uc_open_with_reconnect(SIGN_IN_URL, reconnect_time=6)
 
-    # 按照需求：登入页面等待 3 秒
     log("登入页面等待 3 秒...")
     sb.sleep(3)
     save_shot(sb, "open_signin")
@@ -505,57 +610,38 @@ def do_login(sb):
         log("检测到已处于登录状态")
         return
 
-    # 等待表单渲染 (轮询查找邮箱或密码输入框)
     log("等待登录表单渲染...")
-    email_sel = None
-    pass_sel = None
+    email_sel, pass_sel = None, None
     deadline = time.time() + 30
     while time.time() < deadline:
         email_sel = find_email_input(sb)
         pass_sel = find_password_input(sb)
         if email_sel or pass_sel:
             break
-        try:
-            sb.uc_gui_click_captcha()
-        except Exception:
-            pass
         sb.sleep(2)
 
     if not email_sel and not pass_sel:
-        dump_inputs(sb)
         save_shot(sb, "error_no_login_form")
         raise RuntimeError(f"未能找到邮箱或密码输入框，当前页面: {sb.get_current_url()}")
 
-    # 情况 A：同屏同时存在邮箱和密码输入框 (正如网页截图所示)
-    if email_sel and pass_sel:
-        log(f"检测到同屏邮箱与密码表单，输入邮箱: {EMAIL}")
+    # 输入邮箱
+    if email_sel:
+        log(f"输入邮箱: {EMAIL}")
         sb.type(email_sel, EMAIL)
         sb.sleep(1)
-        log("输入登录密码...")
-        sb.type(pass_sel, PASSWORD)
-        sb.sleep(1)
-        save_shot(sb, "filled_credentials")
-        log("点击 Continue 提交登录...")
-        click_continue(sb)
-        sb.sleep(5)
 
-    # 情况 B：仅显示邮箱输入框 (分步登录)
-    elif email_sel and not pass_sel:
-        log(f"检测到邮箱输入框(分步模式)，输入邮箱: {EMAIL}")
-        sb.type(email_sel, EMAIL)
-        sb.sleep(1)
+    # 若尚未渲染密码框，点击 Continue 进入密码页
+    if not pass_sel:
         save_shot(sb, "filled_email")
-        log("点击 Continue 进入下一步...")
+        log("点击 Continue 进入密码输入步...")
         click_continue(sb)
-        sb.sleep(4)
+        sb.sleep(3)
 
-        log("等待密码输入框出现...")
         p_deadline = time.time() + 20
         while time.time() < p_deadline:
             pass_sel = find_password_input(sb)
             if pass_sel:
                 break
-            # 若默认进了邮箱验证码，检查并点击“使用密码登录 / Use password”
             for pwd_opt in (
                 '//button[contains(., "password") or contains(., "Password")]',
                 '//a[contains(., "password") or contains(., "Password")]',
@@ -570,40 +656,55 @@ def do_login(sb):
                     pass
             sb.sleep(2)
 
-        if not pass_sel:
-            dump_inputs(sb)
-            save_shot(sb, "error_no_password_step2")
-            raise RuntimeError("分步模式未能进入密码输入页")
+    if not pass_sel:
+        check_login_page_errors(sb)
+        save_shot(sb, "error_no_password")
+        raise RuntimeError("未能加载到密码输入框，请查看截图")
 
-        log("输入登录密码...")
-        sb.type(pass_sel, PASSWORD)
-        sb.sleep(1)
-        save_shot(sb, "filled_password")
-        log("点击 Continue 提交登录...")
-        click_continue(sb)
-        sb.sleep(5)
+    log(f"输入登录密码 (密码长度: {len(PASSWORD)} 位)...")
+    sb.type(pass_sel, PASSWORD)
+    sb.sleep(1)
+    save_shot(sb, "filled_password")
 
-    # 情况 C：仅显示密码框 (邮箱已被浏览器记住预填)
-    elif pass_sel and not email_sel:
-        log("检测到密码输入框(邮箱已被记住)，输入登录密码...")
-        sb.type(pass_sel, PASSWORD)
-        sb.sleep(1)
-        save_shot(sb, "filled_password_only")
-        log("点击 Continue 提交登录...")
-        click_continue(sb)
-        sb.sleep(5)
+    log("点击 Continue 提交登录...")
+    click_continue(sb)
+    sb.sleep(5)
 
-    # 等待登录完成进入控制台
     log("等待进入服务器面板...")
-    for _ in range(25):
+    for i in range(25):
         if page_has_servers(sb):
-            log("登录成功，已进入服务器列表！")
+            log(f"登录成功，已进入服务器列表！当前网址: {sb.get_current_url()}")
             save_shot(sb, "logged_in")
             return
+        if i % 5 == 0:
+            check_login_page_errors(sb)
         sb.sleep(2)
 
+    check_login_page_errors(sb)
     save_shot(sb, "error_login_timeout")
-    raise RuntimeError("登录提交后未能进入服务器面板，请查看截图")
+    raise RuntimeError(f"登录提交后未能进入服务器面板，当前停留在: {sb.get_current_url()}")
+
+
+def do_login(sb):
+    # 1. 首选 Cookie 登录
+    if try_cookie_login(sb):
+        return
+
+    # 2. 回退到账号密码登录
+    do_password_login(sb)
+
+
+# ---------------- 出口 IP 探测 ----------------
+def check_egress_ip(sb):
+    """通过浏览器访问 ipify 查看实际出口 IP，验证代理是否生效"""
+    try:
+        sb.open("https://api.ipify.org?format=json")
+        sb.sleep(2)
+        txt = sb.get_text("body")
+        data = json.loads(txt)
+        log(f"🌐 浏览器实际出口 IP: {data.get('ip')}")
+    except Exception as e:
+        log(f"出口 IP 检测略过: {e}")
 
 
 # ---------------- 业务与续期 ----------------
@@ -1038,21 +1139,16 @@ def ensure_started(sb):
 
 # ---------------- 主入口 ----------------
 def main():
-    if not EMAIL:
-        log("错误: 必须配置 EMAIL 环境变量")
-        sys.exit(1)
-    if not PASSWORD:
-        log("错误: 必须配置 PASSWORD (或 EMAIL_PASSWORD) 登录密码环境变量")
+    if not EMAIL and not load_cookies_data():
+        log("错误: 必须配置 EMAIL 或 COOKIES")
         sys.exit(1)
 
-    result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL}"]
+    result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL or 'Cookie 模式'}"]
     credited_any = False
 
-    # Linux 下配合 Xvfb 运行真实环境参数，彻底避免被反爬识别为 HeadlessChrome
     sb_kwargs = dict(uc=True, test=True, locale_code="en", headless=False, xvfb=True)
     log(f"浏览器代理状态: {proxy_label()}")
 
-    # 代理转发逻辑：优先 sing-box 转换
     if PROXY:
         scheme = PROXY.split("://", 1)[0].lower() if "://" in PROXY else ""
         if scheme in ("vless", "hysteria2", "hy2", "trojan", "ss"):
@@ -1068,6 +1164,7 @@ def main():
 
     try:
         with SB(**sb_kwargs) as sb:
+            check_egress_ip(sb)
             do_login(sb)
             open_server_overview(sb)
             main_handle = sb.driver.current_window_handle
