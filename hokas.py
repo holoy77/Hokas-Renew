@@ -2,48 +2,6 @@
 """
 hokas.net 免费服务器自动续期脚本
 (结构参考同账号的 Pella-Renew 项目: Clerk 邮箱验证码登录 + IMAP 取码 + SeleniumBase UC)
-
-流程:
-  1. 打开 hokas 登录页(hokas.net/sign-in), 输入邮箱, 点击 Continue
-  2. 跳转到验证码页(factor-one), 同时取验证码:
-     - IMAP 直读邮箱(默认, 需应用专用密码)
-     - 或浏览器登录 Gmail 网页版从邮件标题读码
-     取到后填入 6 个分格输入框, 点击 Continue 完成登录
-  3. 进入 Dashboard / My Servers, 打开目标服务器(默认 myappas, 或列表第一个)
-     的 Manage -> Overview, 读取并记录 Remaining 剩余时间
-  4. 在 "SERVER EXPIRING" 面板依次处理两个按钮(每个 6 小时可用一次):
-       Add 24 Hours -> Add 12 Hours
-     点击后会新开一个 shrinkme.click 短链标签页, 需要走完广告链:
-       a) 验证页: 过 Cloudflare Turnstile 勾选框, 点 "Click here to continue"
-       b) 中间页(themezom.net, ShrinkMe.io 样式): "STEP 1 OF 2",
-          点大号蓝色按钮 "CLICK TO VERIFY"
-       c) 回到 shrinkme.click: "YOUR LINK IS ALMOST READY." 倒计时结束,
-          点绿色 "Get Link" 按钮, 浏览器跳回 hokas.net 才算这一单完成
-     注意: 每次点击都可能弹广告窗(popunder, 如 VPN 安装页/YouTube 等),
-     真流程始终在 shrinkme 标签页里, 脚本会在每次点击后关掉多余窗口并切回。
-  5. 每个按钮走完后回 Overview 复查 Remaining 时间, 前后对比确认到账
-     (两个按钮都没到账则以非 0 退出码结束, 便于在 Actions 里看出失败)
-  6. 结果通过 Telegram Bot 推送, 全程关键步骤截图到 screenshots/
-
-环境变量(GitHub Secrets):
-  EMAIL           登录邮箱(同时也是收验证码的邮箱)
-  EMAIL_PASSWORD  邮箱 IMAP 授权码/应用专用密码(非网页登录密码)
-  GMAIL_PASSWORD  Gmail 网页登录密码(可选; 用于 IMAP 不可用时浏览器登录 Gmail 读码)
-  CODE_SOURCE     取码方式: auto(默认, 先 IMAP 再网页) / imap / web
-  IMAP_SERVER     IMAP 服务器, 默认 imap.gmail.com
-  IMAP_PORT       IMAP 端口, 默认 993
-  TG_BOT_TOKEN    Telegram 机器人 token
-  TG_CHAT_ID      Telegram 接收消息的 chat id
-  PANEL_URL       面板地址, 默认 https://hokas.net
-  SIGN_IN_URL     登录页地址, 默认 https://hokas.net/sign-in
-  SERVER_NAME     服务器名(可选, 默认优先找 myappas, 找不到则点第一个服务器)
-  SERVER_ID       服务器 ID(可选, 如 b9275; 设置后优先按 ID 找卡片, 不怕名字拼错)
-  PROXY           代理(可选): http://user:pass@host:port 或 socks5://host:port
-                  可直接给浏览器; vless:// 链接会在 runner 上经 Xray 转成
-                  127.0.0.1:1081 的本地 HTTP 代理再给浏览器(浏览器不能直连 vless)
-
-已知风险: shrinkme 的 Cloudflare 对自动化浏览器很不友好, UC 模式也可能被重置。
-脚本对验证做了耐心等待 + 多次重试, 且每一步都截图, 失败时请先看 Artifacts 截图定位。
 """
 
 import atexit
@@ -61,6 +19,7 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import tarfile
 import zipfile
 from datetime import datetime, timezone
 from email.header import decode_header
@@ -69,8 +28,6 @@ import requests
 from seleniumbase import SB
 
 # ---------------- 配置 ----------------
-# 注意: GitHub Actions 中未配置的 secret 会注入为空字符串,
-# 必须用 `or 默认值` 兜底, 不能依赖 os.environ.get 的第二参数
 EMAIL = (os.environ.get("EMAIL") or "").strip()
 EMAIL_PASSWORD = (os.environ.get("EMAIL_PASSWORD") or "").strip()
 IMAP_SERVER = (os.environ.get("IMAP_SERVER") or "imap.gmail.com").strip()
@@ -80,31 +37,22 @@ TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or "").strip()
 PANEL_URL = (os.environ.get("PANEL_URL") or "https://hokas.net").strip().rstrip("/")
 SIGN_IN_URL = (os.environ.get("SIGN_IN_URL") or "https://hokas.net/sign-in").strip()
 SERVER_NAME = (os.environ.get("SERVER_NAME") or "").strip()
-# 服务器 ID(卡片上显示的 ID, 如 b9275): 比名字更可靠, 因为名字拼写
-# 容易看错(如 jaosonserver 与 jasonserver)。设置后优先按 ID 找卡片。
 SERVER_ID = (os.environ.get("SERVER_ID") or "").strip()
-# Gmail 网页登录密码(未单独配置时复用 EMAIL_PASSWORD)
 GMAIL_PASSWORD = (os.environ.get("GMAIL_PASSWORD") or EMAIL_PASSWORD).strip()
-# 取码方式: auto / imap / web
 CODE_SOURCE = (os.environ.get("CODE_SOURCE") or "auto").strip().lower()
-# 家宽代理节点(可选, 由 GitHub Secrets 的 PROXY 注入):
-# 格式如 http://user:pass@host:port 或 socks5://user:pass@host:port。
-# GitHub 机房 IP 过 shrinkme/Cloudflare 容易被判机器人, 家宽 IP 更像真人。
-# 代理只作用于浏览器流量(HOKAS 登录 + shrinkme), IMAP 取码不走代理。
-# 注意: 该值含账号密码, 绝不能打印到日志, 只能打印脱敏后的协议+主机。
 PROXY = (os.environ.get("PROXY") or "").strip()
+# 可通过环境变量切换本地内核后端: "sing-box" 或 "xray" (默认优先使用 sing-box)
+PROXY_CORE = (os.environ.get("PROXY_CORE") or "sing-box").strip().lower()
 
-SHOT_DIR = os.path.join(os.getcwd(), "screenshots")  # 关键步骤/失败截图目录
+SHOT_DIR = os.path.join(os.getcwd(), "screenshots")
 _shot_counter = [0]
 
-CODE_MAX_RETRIES = 6      # 未收到验证码邮件时最多尝试次数
-CODE_POLL_INTERVAL = 10   # 每次尝试间隔(秒)
+CODE_MAX_RETRIES = 6
+CODE_POLL_INTERVAL = 10
 
 GMAIL_URL = "https://mail.google.com/mail/u/0/#inbox"
-# 未登录时直访 mail.google.com 会被重定向到营销页, 必须直接打开账号登录页
 GMAIL_SIGNIN_URL = ("https://accounts.google.com/ServiceLogin?service=mail"
                     "&continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F")
-# Gmail 列表页/邮件标题中的验证码格式: "293767 is your verification code"
 CODE_SUBJECT_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)\s+is your verification code", re.I)
 
 
@@ -113,61 +61,245 @@ def log(msg):
 
 
 def proxy_label():
-    """代理的脱敏描述: 只显示协议和主机端口, 绝不包含账号密码、
-    查询参数(SNI/路径等)和备注。教训(2026-11-04 run 41748751838):
-    旧版把 vless URI 的查询串也打进了日志, 暴露了节点主机/SNI。"""
     if not PROXY:
         return "未配置(直连)"
     try:
         rest = PROXY.split("://", 1)[1] if "://" in PROXY else PROXY
         hostport = rest.split("@")[-1].split("?")[0].split("#")[0].split("/")[0]
         scheme = PROXY.split("://", 1)[0] if "://" in PROXY else "http"
-        return f"已启用({scheme}://{hostport})"
+        return f"已启用({scheme}://{hostport}, 内核: {PROXY_CORE})"
     except Exception:
         return "已启用(地址已脱敏)"
 
 
-# ---------------- VLESS 节点转本地代理(Xray) ----------------
-# 浏览器不能直接用 vless:// 协议(2026-11-04 run 41748751838 在启动阶段
-# 就被 seleniumbase 的代理校验拒绝, 浏览器根本没起来)。
-# 做法: 在 runner 上起一个 Xray 进程, 把 VLESS 节点转成
-# 127.0.0.1:1081 的本地 HTTP 代理, 再把这个普通地址给浏览器。
-# 节点 UUID 只出现在 runner 本地的临时配置文件里, 绝不打日志。
-_xray_proc = None
+# ---------------- 后台转发进程管理 ----------------
+_proxy_proc = None
 
 
-def _stop_xray():
-    global _xray_proc
+def _stop_proxy():
+    global _proxy_proc
     try:
-        if _xray_proc is not None and _xray_proc.poll() is None:
-            _xray_proc.terminate()
+        if _proxy_proc is not None and _proxy_proc.poll() is None:
+            _proxy_proc.terminate()
     except Exception:
         pass
 
 
-def _print_xray_tail():
-    """把 Xray 运行时日志的末尾打进跑日志(诊断用)。
-    教训(2026-11-04 run 41800585122): 浏览器“连接被重置”时, 真正的
-    原因(握手失败/UDP 不通/节点拒绝)只写在 Xray 的日志里, 而它之前
-    没进跑的产物、跑完就丢了, 导致只能看到症状、看不到原因。
-    只在文件存在且非空时打印, 长度截断; Xray 日志不含配置密码,
-    只有地址和报错, 可安全进日志。任何异常都静默, 绝不因此坏了主流程。"""
+def _print_proxy_tail(log_path):
     try:
-        if not os.path.isfile("/tmp/xray-error.log"):
+        if not os.path.isfile(log_path):
             return
-        tail = open("/tmp/xray-error.log", errors="replace").read()[-3000:]
+        tail = open(log_path, errors="replace").read()[-3000:]
         if tail.strip():
-            log(f"Xray 运行时日志(末尾):\n{tail.strip()}")
+            log(f"代理转发内核运行时日志(末尾):\n{tail.strip()}")
     except Exception:
         pass
 
 
-def parse_vless_uri(uri):
-    """解析 vless://UUID@HOST:PORT?params, 返回节点 dict。
-    调用方绝不能把原始 URI 或 UUID 打进日志。"""
+# ---------------- sing-box 节点转换与运行 ----------------
+def ensure_singbox():
+    bindir = "/tmp/singbox-bin"
+    exe = os.path.join(bindir, "sing-box")
+    if os.path.isfile(exe) and os.access(exe, os.X_OK):
+        return exe
+    os.makedirs(bindir, exist_ok=True)
+    tar_path = os.path.join(bindir, "singbox.tar.gz")
+    log("正在获取 sing-box 最新版本并下载...")
+    try:
+        api_url = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+        req = urllib.request.Request(api_url, headers={"User-Agent": "hokas-renew"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        down_url = None
+        for asset in data.get("assets", []):
+            name = asset.get("name", "")
+            if "linux-amd64.tar.gz" in name:
+                down_url = asset.get("browser_download_url")
+                break
+        if not down_url:
+            raise RuntimeError("未在 Release 中找到 linux-amd64.tar.gz 资产")
+    except Exception as e:
+        log(f"获取 sing-box release 失败，尝试备用地址: {e}")
+        down_url = "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-linux-amd64.tar.gz"
+
+    req = urllib.request.Request(down_url, headers={"User-Agent": "hokas-renew"})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(tar_path, "wb") as f:
+        shutil.copyfileobj(resp, f)
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+        for member in tar.getmembers():
+            if member.name.endswith("/sing-box") or member.name == "sing-box":
+                f = tar.extractfile(member)
+                if f:
+                    with open(exe, "wb") as dest:
+                        dest.write(f.read())
+                    break
+    os.chmod(exe, 0o755)
+    return exe
+
+
+def parse_uri_to_singbox_outbound(uri):
     p = urllib.parse.urlparse(uri)
-    if p.scheme.lower() != "vless":
-        raise ValueError("不是 vless:// 链接")
+    scheme = p.scheme.lower()
+    host = p.hostname
+    port = p.port
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(p.query).items()}
+
+    if scheme == "vless":
+        uuid = p.username
+        if not uuid or not host or not port:
+            raise ValueError("vless 缺少必要字段")
+        outbound = {
+            "type": "vless",
+            "tag": "proxy-out",
+            "server": host,
+            "server_port": port,
+            "uuid": uuid,
+            "flow": q.get("flow", ""),
+        }
+        sec = (q.get("security") or "none").lower()
+        if sec in ("tls", "reality"):
+            tls_cfg = {
+                "enabled": True,
+                "server_name": q.get("sni") or q.get("serverName") or host,
+                "utls": {"enabled": True, "fingerprint": q.get("fp") or "chrome"}
+            }
+            if sec == "reality":
+                tls_cfg["reality"] = {
+                    "enabled": True,
+                    "public_key": q.get("pbk", ""),
+                    "short_id": q.get("sid", "")
+                }
+            outbound["tls"] = tls_cfg
+
+        net = (q.get("type") or "tcp").lower()
+        if net == "ws":
+            outbound["transport"] = {
+                "type": "ws",
+                "path": q.get("path") or "/",
+                "headers": {"Host": q.get("host") or host}
+            }
+        elif net == "grpc":
+            outbound["transport"] = {
+                "type": "grpc",
+                "service_name": q.get("serviceName", "")
+            }
+        return outbound
+
+    elif scheme in ("hysteria2", "hy2"):
+        password = p.password or p.username
+        if not password or not host or not port:
+            raise ValueError("hysteria2 缺少必要字段")
+        outbound = {
+            "type": "hysteria2",
+            "tag": "proxy-out",
+            "server": host,
+            "server_port": port,
+            "password": password,
+            "tls": {
+                "enabled": True,
+                "server_name": q.get("sni") or q.get("peer") or host,
+                "insecure": (q.get("insecure") or "").lower() in ("1", "true")
+            }
+        }
+        obfs_type = (q.get("obfs") or "").lower()
+        if obfs_type == "salamander":
+            outbound["obfs"] = {
+                "type": "salamander",
+                "password": q.get("obfs-password") or q.get("obfs_password") or ""
+            }
+        return outbound
+
+    elif scheme == "trojan":
+        password = p.password or p.username
+        return {
+            "type": "trojan",
+            "tag": "proxy-out",
+            "server": host,
+            "server_port": port,
+            "password": password,
+            "tls": {
+                "enabled": True,
+                "server_name": q.get("sni") or host
+            }
+        }
+
+    elif scheme == "ss":
+        userinfo = p.username
+        if p.password:
+            userinfo = f"{p.username}:{p.password}"
+        try:
+            import base64
+            userinfo = base64.b64decode(userinfo + "==").decode()
+        except Exception:
+            pass
+        if ":" not in userinfo:
+            raise ValueError("Shadowsocks 用户信息解析失败")
+        method, password = userinfo.split(":", 1)
+        return {
+            "type": "shadowsocks",
+            "tag": "proxy-out",
+            "server": host,
+            "server_port": port,
+            "method": method,
+            "password": password
+        }
+
+    else:
+        raise ValueError(f"sing-box 暂不支持直接解析协议: {scheme}")
+
+
+def start_singbox_proxy(uri):
+    global _proxy_proc
+    log("使用 sing-box 启动本地代理转发...")
+    sb_bin = ensure_singbox()
+    outbound = parse_uri_to_singbox_outbound(uri)
+    config = {
+        "log": {"level": "warn"},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 1081
+            }
+        ],
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"}
+        ]
+    }
+    cfg_path = "/tmp/singbox-config.json"
+    with open(cfg_path, "w") as f:
+        json.dump(config, f)
+    os.chmod(cfg_path, 0o600)
+
+    err_path = "/tmp/proxy-error.log"
+    err_f = open(err_path, "wb")
+    _proxy_proc = subprocess.Popen(
+        [sb_bin, "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL, stderr=err_f)
+    atexit.register(_stop_proxy)
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", 1081), timeout=2):
+                log("sing-box 转发就绪: 本地混合代理 127.0.0.1:1081")
+                return "127.0.0.1:1081"
+        except OSError:
+            if _proxy_proc.poll() is not None:
+                err_f.close()
+                _print_proxy_tail(err_path)
+                raise RuntimeError("sing-box 进程意外退出，转换失败")
+            time.sleep(1)
+    _stop_proxy()
+    raise RuntimeError("等待本地代理端口 1081 超时，sing-box 转换失败")
+
+
+# ---------------- Xray 备用转换 ----------------
+def parse_vless_uri(uri):
+    p = urllib.parse.urlparse(uri)
     uuid = p.username
     host = p.hostname
     port = p.port
@@ -190,55 +322,40 @@ def parse_vless_uri(uri):
 
 
 def build_xray_config(node):
-    """由节点 dict 生成 Xray 配置 dict(纯函数, 便于单测)。"""
     stream = {"network": node["network"]}
     sec = node["security"]
     if sec == "tls":
         stream["security"] = "tls"
-        stream["tlsSettings"] = {"serverName": node["sni"],
-                                 "fingerprint": node["fp"]}
+        stream["tlsSettings"] = {"serverName": node["sni"], "fingerprint": node["fp"]}
     elif sec == "reality":
         stream["security"] = "reality"
-        stream["realitySettings"] = {"serverName": node["sni"],
-                                     "publicKey": node["pbk"],
-                                     "shortId": node["sid"],
-                                     "fingerprint": node["fp"]}
+        stream["realitySettings"] = {"serverName": node["sni"], "publicKey": node["pbk"], "shortId": node["sid"], "fingerprint": node["fp"]}
     if node["network"] == "ws":
-        stream["wsSettings"] = {"path": node["ws_path"],
-                                "headers": {"Host": node["ws_host"]}}
+        stream["wsSettings"] = {"path": node["ws_path"], "headers": {"Host": node["ws_host"]}}
     elif node["network"] == "grpc":
         stream["grpcSettings"] = {"serviceName": node["service_name"]}
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
-            {"port": 1080, "listen": "127.0.0.1", "protocol": "socks",
-             "settings": {"auth": "noauth", "udp": True}},
-            {"port": 1081, "listen": "127.0.0.1", "protocol": "http",
-             "settings": {}},
+            {"port": 1081, "listen": "127.0.0.1", "protocol": "http", "settings": {}},
         ],
         "outbounds": [
             {"protocol": "vless",
-             "settings": {"vnext": [{"address": node["address"],
-                                     "port": node["port"],
-                                     "users": [{"id": node["uuid"],
-                                                "encryption": "none",
-                                                "flow": node["flow"]}]}]},
+             "settings": {"vnext": [{"address": node["address"], "port": node["port"], "users": [{"id": node["uuid"], "encryption": "none", "flow": node["flow"]}]}]},
              "streamSettings": stream},
         ],
     }
 
 
 def ensure_xray():
-    """下载 Xray 内核到 /tmp/xray-bin(已存在则复用), 返回可执行路径。"""
     bindir = "/tmp/xray-bin"
     exe = os.path.join(bindir, "xray")
     if os.path.isfile(exe) and os.access(exe, os.X_OK):
         return exe
     os.makedirs(bindir, exist_ok=True)
-    url = ("https://github.com/XTLS/Xray-core/releases/latest/download/"
-           "Xray-linux-64.zip")
+    url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
     zpath = os.path.join(bindir, "xray.zip")
-    log("正在下载 Xray 内核(用于 VLESS 转换)...")
+    log("正在下载 Xray 内核...")
     req = urllib.request.Request(url, headers={"User-Agent": "hokas-renew"})
     with urllib.request.urlopen(req, timeout=120) as resp, open(zpath, "wb") as f:
         shutil.copyfileobj(resp, f)
@@ -248,181 +365,48 @@ def ensure_xray():
     return exe
 
 
-def start_vless_proxy(uri):
-    """启动 Xray 把 VLESS 节点转成本地代理, 返回给浏览器的代理串。
-    任何一步失败都抛错, 调用方应在启动阶段退出, 不进登录。"""
-    global _xray_proc
+def start_xray_proxy(uri):
+    global _proxy_proc
+    log("使用 Xray 启动本地代理转换...")
     node = parse_vless_uri(uri)
-    log("检测到 VLESS 节点, 正在启动 Xray 转成本地代理...")
     xray = ensure_xray()
     cfg_path = "/tmp/xray-config.json"
     with open(cfg_path, "w") as f:
         json.dump(build_xray_config(node), f)
     os.chmod(cfg_path, 0o600)
-    _xray_proc = subprocess.Popen(
-        [xray, "run", "-c", cfg_path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    atexit.register(_stop_xray)
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        try:
-            with socket.create_connection(("127.0.0.1", 1081), timeout=2):
-                log("VLESS 转换就绪: 本地代理 127.0.0.1:1081")
-                return "127.0.0.1:1081"
-        except OSError:
-            if _xray_proc.poll() is not None:
-                raise RuntimeError("Xray 进程已退出, VLESS 转换失败")
-            time.sleep(1)
-    _stop_xray()
-    raise RuntimeError("等待本地代理端口 1081 超时, VLESS 转换失败")
-
-
-def parse_hysteria2_uri(uri):
-    """解析 hysteria2://PASSWORD@HOST:PORT?params(别名 hy2://), 返回节点 dict。
-    hy2 的密码就是 userinfo 本身(无用户名); 若写成 user:password@ 形式,
-    则取冒号后的部分。常用参数: sni、obfs(=salamander)、obfs-password、
-    insecure(=1/true 时允许自签证书)。调用方绝不能把原始 URI 或密码打进日志。
-    注意: hy2 走 UDP/QUIC, 若 runner 出口禁 UDP 则连不上, 与配置无关。"""
-    p = urllib.parse.urlparse(uri)
-    if p.scheme.lower() not in ("hysteria2", "hy2"):
-        raise ValueError("不是 hysteria2:// 链接")
-    password = p.password or p.username
-    host = p.hostname
-    port = p.port
-    if not password or not host or not port:
-        raise ValueError("hysteria2 链接缺少密码/主机/端口")
-    q = {k: v[0] for k, v in urllib.parse.parse_qs(p.query).items()}
-    insecure = (q.get("insecure") or "").lower() in ("1", "true", "yes")
-    return {
-        "password": password, "address": host, "port": port,
-        "sni": q.get("sni") or q.get("peer") or host,
-        "obfs": (q.get("obfs") or "").lower(),
-        "obfs_password": q.get("obfs-password") or q.get("obfs_password") or "",
-        "insecure": insecure,
-        # 新版 Xray 的证书指纹/验域名参数(见 build_xray_config_hysteria2)。
-        "pin": q.get("pinSHA256") or q.get("pcs") or q.get("pinnedPeerCertSha256") or "",
-        "vcn": q.get("vcn") or q.get("verifyPeerCertByName") or "",
-    }
-
-
-def build_xray_config_hysteria2(node):
-    """由 hy2 节点 dict 生成 Xray 配置 dict(纯函数, 便于单测)。
-    教训(2026-11-04 run 41797277254): 上游 Xray-core 根本不认
-    protocol="hysteria2"(本地实测: "unknown config id: hysteria2",
-    连 streamSettings.network="hysteria2" 也是 "unknown transport
-    protocol")——那个 hysteria2 出站形状属于第三方分支, 不是上游。
-    上游的正确形状是 legacy 的 hysteria v2(本地经 xray run -test 验证
-    Configuration OK): protocol="hysteria", settings 带 version=2,
-    streamSettings.network="hysteria", hysteriaSettings 里 version=2 +
-    auth=密码; salamander 混淆走 streamSettings.finalmask。
-    入站与 VLESS 版相同: 本地 socks 1080 + http 1081, 浏览器只连 1081。
-    非 salamander 的 obfs 暂不支持, 直接抛错让启动失败(零成本), 而不是
-    静默丢掉一个连接必需的参数、让后面登录阶段莫名其妙失败。"""
-    if node["obfs"] and node["obfs"] != "salamander":
-        raise ValueError(f"暂不支持 obfs 类型: {node['obfs']}(仅支持 salamander)")
-    # TLS: 新版 Xray(2026-06-01 起)已移除 allowInsecure, 含
-    # allowInsecure=true 的配置整个无法加载(本地实测报错)。所以这里
-    # 永远不写 allowInsecure: 证书有效时正常验证即可; 自签证书则需要
-    # 链接里带 pcs 证书指纹(否则只能靠默认验证, 连不上会在登录阶段
-    # 失败, 不耗验证码)。vcn 用于指定验域名。
-    tls = {"serverName": node["sni"], "fingerprint": "chrome",
-           "alpn": ["h3"]}
-    if node.get("pin"):
-        tls["pinnedPeerCertSha256"] = node["pin"]
-    if node.get("vcn"):
-        tls["verifyPeerCertByName"] = node["vcn"]
-    stream = {
-        "network": "hysteria", "security": "tls",
-        "tlsSettings": tls,
-        "hysteriaSettings": {"version": 2, "auth": node["password"]},
-    }
-    if node["obfs"] == "salamander":
-        stream["finalmask"] = {
-            "udp": [{"type": "salamander",
-                     "settings": {"password": node["obfs_password"]}}]}
-    # 诊断用: hy2 的日志级别暂为 info(多记连接尝试, 便于定位“连接被
-    # 重置”到底是握手失败、UDP 不通还是节点拒绝); 定位清楚后可改回 warning。
-    return {
-        "log": {"loglevel": "info"},
-        "inbounds": [
-            {"port": 1080, "listen": "127.0.0.1", "protocol": "socks",
-             "settings": {"auth": "noauth", "udp": True}},
-            {"port": 1081, "listen": "127.0.0.1", "protocol": "http",
-             "settings": {}},
-        ],
-        "outbounds": [
-            {"protocol": "hysteria",
-             "settings": {"version": 2, "address": node["address"],
-                          "port": node["port"]},
-             "streamSettings": stream},
-        ],
-    }
-
-
-def start_hysteria2_proxy(uri):
-    """启动 Xray 把 hysteria2 节点转成本地代理, 返回给浏览器的代理串。
-    故意不复用 start_vless_proxy 的解析/配置(两者协议不同), 但启动与
-    等待端口的逻辑相同: 任何一步失败都抛错, 调用方应在启动阶段退出,
-    不进登录、不消耗验证码。若 Xray 因配置形状不对而退出, 这里会直接
-    报 “Xray 进程已退出”, 属于启动失败, 同样零成本。"""
-    global _xray_proc
-    node = parse_hysteria2_uri(uri)
-    if node["insecure"] and not node.get("pin"):
-        log("注意: 链接要求 insecure=1, 但新版 Xray 已移除跳过证书验证的"
-            "功能, 本次按正常证书验证启动; 若节点证书有效则不受影响, "
-            "若是自签证书则连接阶段会失败(不耗验证码)")
-    log("检测到 hysteria2 节点, 正在启动 Xray 转成本地代理...")
-    xray = ensure_xray()
-    cfg_path = "/tmp/xray-config.json"
-    with open(cfg_path, "w") as f:
-        json.dump(build_xray_config_hysteria2(node), f)
-    os.chmod(cfg_path, 0o600)
-    # 教训(2026-11-04 run 41797277254): Xray 的 stderr 原先被丢进 DEVNULL,
-    # 它因配置不对而退出时日志里只剩 "Xray 进程已退出", 查不到原因。
-    # 现改为把 stderr 记到文件, 启动失败时把最后几行打进日志(不含配置
-    # 内容, 只有 Xray 自己的报错, 不会漏密码)。
-    err_path = "/tmp/xray-error.log"
+    err_path = "/tmp/proxy-error.log"
     err_f = open(err_path, "wb")
-    _xray_proc = subprocess.Popen(
-        [xray, "run", "-c", cfg_path],
-        stdout=subprocess.DEVNULL, stderr=err_f)
-    atexit.register(_stop_xray)
+    _proxy_proc = subprocess.Popen([xray, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=err_f)
+    atexit.register(_stop_proxy)
     deadline = time.time() + 30
     while time.time() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", 1081), timeout=2):
-                log("hysteria2 转换就绪: 本地代理 127.0.0.1:1081")
+                log("Xray 转换就绪: 本地代理 127.0.0.1:1081")
                 return "127.0.0.1:1081"
         except OSError:
-            if _xray_proc.poll() is not None:
-                try:
-                    err_f.close()
-                    tail = open(err_path, errors="replace").read()[-500:]
-                    log(f"Xray 报错(末尾): {tail.strip()}")
-                except Exception:
-                    pass
-                raise RuntimeError("Xray 进程已退出, hysteria2 转换失败")
+            if _proxy_proc.poll() is not None:
+                err_f.close()
+                _print_proxy_tail(err_path)
+                raise RuntimeError("Xray 进程退出，转换失败")
             time.sleep(1)
-    _stop_xray()
-    raise RuntimeError("等待本地代理端口 1081 超时, hysteria2 转换失败")
+    _stop_proxy()
+    raise RuntimeError("等待本地代理端口 1081 超时")
 
 
 def save_shot(sb, name):
-    """保存带序号的页面截图到 screenshots 目录(CI 中会作为 Artifact 上传)"""
     try:
         os.makedirs(SHOT_DIR, exist_ok=True)
         _shot_counter[0] += 1
-        path = os.path.join(
-            SHOT_DIR, f"{_shot_counter[0]:02d}_{name}.png")
+        path = os.path.join(SHOT_DIR, f"{_shot_counter[0]:02d}_{name}.png")
         sb.save_screenshot(path)
         log(f"已保存截图: {path}")
     except Exception as e:
         log(f"截图失败: {e}")
 
 
-# ---------------- Telegram ----------------
+# ---------------- Telegram 通知 ----------------
 def send_tg(text):
-    """发送 Telegram 消息, 未配置时静默跳过"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("TG_BOT_TOKEN/TG_CHAT_ID 未配置, 跳过 TG 通知")
         return
@@ -440,7 +424,7 @@ def send_tg(text):
         log(f"TG 通知异常: {e}")
 
 
-# ---------------- 邮箱验证码 ----------------
+# ---------------- 邮箱验证码获取 ----------------
 def _decode(value):
     if not value:
         return ""
@@ -455,7 +439,6 @@ def _decode(value):
 
 
 def _mail_body(msg):
-    """提取邮件正文纯文本"""
     texts = []
     if msg.is_multipart():
         for part in msg.walk():
@@ -474,14 +457,12 @@ def _mail_body(msg):
 
 
 def _mail_matches(sender, subject):
-    """判断是否验证码邮件: 发件人含 hokas/clerk, 或标题是验证码格式"""
     s = subject.lower()
     return ("hokas" in sender or "clerk" in sender or "hokas" in s
             or "verification code" in s or "verify" in s)
 
 
 def _scan_folder(box, folder, after_ts, diag_lines):
-    """在指定邮件夹中查找 after_ts 之后的验证码邮件, 找到返回 6 位码"""
     status, _ = box.select(folder, readonly=True)
     if status != "OK":
         return None
@@ -490,7 +471,6 @@ def _scan_folder(box, folder, after_ts, diag_lines):
     if status != "OK":
         return None
     ids = data[0].split()
-    # 从最新的邮件开始找
     for mail_id in reversed(ids[-20:]):
         status, msg_data = box.fetch(mail_id, "(RFC822)")
         if status != "OK":
@@ -503,7 +483,6 @@ def _scan_folder(box, folder, after_ts, diag_lines):
             diag_lines.append(f"  [{folder}] {date_hdr} | {sender} | {subject}")
         if not _mail_matches(sender, subject):
             continue
-        # 校验邮件时间, 避免读到旧验证码
         if date_hdr:
             try:
                 mail_ts = email.utils.parsedate_to_datetime(date_hdr).timestamp()
@@ -520,12 +499,7 @@ def _scan_folder(box, folder, after_ts, diag_lines):
 
 
 def fetch_verification_code(after_ts):
-    """
-    轮询 IMAP 收件箱(含垃圾邮件夹), 获取 after_ts 之后到达的验证码邮件,
-    返回 6 位数字验证码; 最多尝试 CODE_MAX_RETRIES 次, 不会无限重试
-    """
     last_err = None
-    # Gmail 需额外搜垃圾邮件夹和全部邮件(新发件人容易被判垃圾)
     folders = ["INBOX"]
     if "gmail" in IMAP_SERVER:
         folders += ['"[Gmail]/Spam"', '"[Gmail]/All Mail"']
@@ -533,11 +507,9 @@ def fetch_verification_code(after_ts):
         log(f"第 {attempt}/{CODE_MAX_RETRIES} 次尝试读取验证码邮件...")
         try:
             box = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-            # Gmail 应用专用密码页面展示为带空格的 4x4 分组, 登录时需去掉空格
             imap_password = (EMAIL_PASSWORD.replace(" ", "")
                              if "gmail" in IMAP_SERVER else EMAIL_PASSWORD)
             box.login(EMAIL, imap_password)
-            # 第一次尝试时输出最近邮件清单, 便于排查为何匹配不到
             diag_lines = [] if attempt == 1 else None
             code = None
             for folder in folders:
@@ -555,26 +527,16 @@ def fetch_verification_code(after_ts):
         except Exception as e:
             last_err = e
             log(f"读取邮箱异常: {e}")
-            # 认证失败重试无意义, 直接报错提示检查密码
-            if "AUTHENTICATIONFAILED" in str(e).upper() \
-                    or "Invalid credentials" in str(e):
-                raise RuntimeError(
-                    f"IMAP 认证失败, 请检查 EMAIL_PASSWORD 是否为有效的应用专用密码: {e}")
+            if "AUTHENTICATIONFAILED" in str(e).upper() or "Invalid credentials" in str(e):
+                raise RuntimeError(f"IMAP 认证失败, 请检查 EMAIL_PASSWORD 是否为有效的应用专用密码: {e}")
         if attempt < CODE_MAX_RETRIES:
             log(f"尚未收到验证码邮件, {CODE_POLL_INTERVAL} 秒后重试...")
             time.sleep(CODE_POLL_INTERVAL)
     suffix = f" (最后一次异常: {last_err})" if last_err else ""
-    raise TimeoutError(
-        f"尝试 {CODE_MAX_RETRIES} 次仍未收到验证码邮件, 停止重试{suffix}")
+    raise TimeoutError(f"尝试 {CODE_MAX_RETRIES} 次仍未收到验证码邮件, 停止重试{suffix}")
 
 
-# ---------------- Gmail 网页版读码(IMAP 不可用时的备用方案) ----------------
 def gmail_login(sb):
-    """
-    在新标签页登录 Gmail 网页版: 输入邮箱 -> Next -> 输入密码 -> Next
-    成功返回新标签页 handle, 失败返回 None(已关闭标签页)
-    """
-    # 应用专用密码无法登录网页, 没有网页密码就不尝试这条路
     if not GMAIL_PASSWORD:
         log("未配置 GMAIL_PASSWORD(网页登录密码), 跳过 Gmail 网页登录")
         return None
@@ -588,56 +550,39 @@ def gmail_login(sb):
         sb.open(GMAIL_SIGNIN_URL)
         sb.sleep(6)
 
-        # 已登录时会直接进收件箱
         if gmail_in_inbox(sb):
             log("Gmail 已处于登录状态")
             sb.driver.switch_to.window(main_tab)
             return gmail_tab
 
-        # 若被带到 Gmail 营销页, 点右上角 Sign in 进登录表单
         if not sb.is_element_visible('input[type="email"]'):
-            for sel in ('a:contains("Sign in")',
-                        '//a[contains(translate(., "SIGN IN", "sign in"), "sign in")]'):
+            for sel in ('a:contains("Sign in")', '//a[contains(translate(., "SIGN IN", "sign in"), "sign in")]'):
                 try:
                     if sb.is_element_visible(sel):
-                        log("当前是 Gmail 营销页, 点击 Sign in...")
                         sb.click(sel)
                         sb.sleep(6)
                         break
                 except Exception:
                     continue
 
-        # 第一步: 输入邮箱点 Next
         if sb.is_element_visible('input[type="email"]'):
             sb.type('input[type="email"]', EMAIL)
-            log(f"Gmail 登录: 已输入邮箱 {EMAIL}")
-            save_shot(sb, "g1_gmail_email")
             gmail_click_next(sb)
             sb.sleep(6)
-        else:
-            save_shot(sb, "g_error_no_email_box")
-            log("Gmail 登录页未找到邮箱输入框")
 
-        # 第二步: 输入密码点 Next
         for _ in range(8):
             if sb.is_element_visible('input[type="password"]'):
                 break
             sb.sleep(2)
         if not sb.is_element_visible('input[type="password"]'):
-            save_shot(sb, "g_error_no_password_box")
             raise RuntimeError("Gmail 登录未出现密码输入框(可能被风控拦截)")
         sb.type('input[type="password"]', password)
-        log("Gmail 登录: 已输入密码")
         gmail_click_next(sb)
         sb.sleep(8)
-        save_shot(sb, "g2_gmail_after_login")
 
-        # 风控提示检测
-        for tip in ("couldn't sign you in", "This browser or app may not be secure",
-                    "Verify it’s you", "2-Step Verification"):
+        for tip in ("couldn't sign you in", "This browser or app may not be secure", "Verify it’s you", "2-Step Verification"):
             try:
                 if sb.is_text_visible(tip):
-                    save_shot(sb, "g_error_blocked")
                     raise RuntimeError(f"Gmail 网页登录被 Google 风控拦截: {tip}")
             except RuntimeError:
                 raise
@@ -646,11 +591,9 @@ def gmail_login(sb):
 
         for _ in range(10):
             if gmail_in_inbox(sb):
-                log("Gmail 登录成功, 已进入收件箱")
                 sb.driver.switch_to.window(main_tab)
                 return gmail_tab
             sb.sleep(3)
-        save_shot(sb, "g_error_not_inbox")
         raise RuntimeError("Gmail 登录后未能进入收件箱")
     except Exception as e:
         log(f"Gmail 网页登录失败: {e}")
@@ -665,39 +608,30 @@ def gmail_login(sb):
 
 
 def gmail_click_next(sb):
-    """点击 Google 登录页的 Next/下一步按钮"""
-    for sel in ("#identifierNext", "#passwordNext",
-                '//button[contains(., "Next")]',
-                '//span[text()="Next"]/ancestor::button[1]'):
+    for sel in ("#identifierNext", "#passwordNext", '//button[contains(., "Next")]', '//span[text()="Next"]/ancestor::button[1]'):
         try:
             if sb.is_element_visible(sel):
                 sb.click(sel)
                 return True
         except Exception:
             continue
-    # 兜底: 直接回车提交
     try:
         sb.send_keys('input:focus', "\n")
         return True
     except Exception:
-        log("未找到 Next 按钮")
         return False
 
 
 def gmail_in_inbox(sb):
     try:
-        return ("mail.google.com" in sb.get_current_url()
-                and (sb.is_element_present('div[role="main"]')
-                     or sb.is_text_visible("Inbox")))
+        return ("mail.google.com" in sb.get_current_url() and (sb.is_element_present('div[role="main"]') or sb.is_text_visible("Inbox")))
     except Exception:
         return False
 
 
 def gmail_newest_code(sb):
-    """从 Gmail 收件箱列表页标题中提取最新的 6 位验证码, 无则返回 None"""
     try:
-        txt = sb.get_text('div[role="main"]') if sb.is_element_present('div[role="main"]') \
-            else sb.get_text("body")
+        txt = sb.get_text('div[role="main"]') if sb.is_element_present('div[role="main"]') else sb.get_text("body")
     except Exception:
         return None
     m = CODE_SUBJECT_RE.search(txt or "")
@@ -705,32 +639,22 @@ def gmail_newest_code(sb):
 
 
 def gmail_wait_new_code(sb, gmail_tab, baseline):
-    """
-    在 Gmail 标签页轮询新验证码(与 baseline 不同则认为是本次新收到的),
-    最多尝试 CODE_MAX_RETRIES 次
-    """
     main_tab = sb.driver.current_window_handle
     code = None
     try:
         for attempt in range(1, CODE_MAX_RETRIES + 1):
             sb.driver.switch_to.window(gmail_tab)
-            log(f"第 {attempt}/{CODE_MAX_RETRIES} 次刷新 Gmail 网页读取验证码...")
             try:
                 sb.refresh()
                 sb.sleep(6)
-            except Exception as e:
-                log(f"刷新 Gmail 异常: {e}")
+            except Exception:
+                pass
             newest = gmail_newest_code(sb)
             if newest and newest != baseline:
                 log(f"从 Gmail 网页获取到新验证码: {newest}")
-                save_shot(sb, "g3_gmail_code")
                 code = newest
                 break
-            if attempt == CODE_MAX_RETRIES:
-                save_shot(sb, "g_error_no_code")
-            else:
-                log(f"尚未收到新验证码, {CODE_POLL_INTERVAL} 秒后重试...")
-                sb.sleep(CODE_POLL_INTERVAL)
+            sb.sleep(CODE_POLL_INTERVAL)
     finally:
         try:
             sb.driver.switch_to.window(main_tab)
@@ -741,35 +665,24 @@ def gmail_wait_new_code(sb, gmail_tab, baseline):
     return code
 
 
-# ---------------- 验证码输入框 ----------------
+# ---------------- 输入框与表单交互 ----------------
 def dump_inputs(sb):
-    """调试用: 把页面上所有 input 的关键属性打印到日志, 便于下次按实际 DOM 修选择器"""
     try:
         info = sb.execute_script(
             "return Array.from(document.querySelectorAll('input')).map(el => "
             "({type: el.type, name: el.name, id: el.id, auto: el.autocomplete, "
-            "mode: el.inputMode, max: el.maxLength, ph: el.placeholder, "
-            "cls: el.className, vis: !!(el.offsetWidth || el.offsetHeight)}))")
-        log(f"页面 input 清单(共 {len(info)} 个): {info}")
-    except Exception as e:
-        log(f"读取 input 清单失败: {e}")
+            "mode: el.inputMode, max: el.maxLength, ph: el.placeholder, vis: !!(el.offsetWidth || el.offsetHeight)}))")
+        log(f"页面 input 清单: {info}")
+    except Exception:
+        pass
 
 
 def find_otp_inputs(sb, timeout=40):
-    """查找验证码输入框(Clerk 为 6 个分格), 轮询等待渲染, 返回可见元素列表.
-
-    首跑教训: 旧版只查一次, 且 HOKAS 的 factor-one 输入框属性与 Pella 的
-    Clerk 版本不同, 导致直接报"未找到验证码输入框"。新版: 轮询 + 更宽的选择器
-    + 通用兜底(表单内所有可见的单字符/数字输入框, 或单个验证码框)。
-    """
     selectors = (
         'input[data-otp-input]', 'input[autocomplete="one-time-code"]',
         'input[name^="codeInput"]', 'input[inputmode="numeric"]',
-        'input[maxlength="1"]',
-        'input[name="code"]', 'input[id*="code"]', 'input[id*="otp"]',
-        'input[data-testid*="otp"]', 'input[data-testid*="code"]',
-        'input[aria-label*="digit" i]', 'input[aria-label*="code" i]',
-        'input[placeholder*="code" i]', 'input[placeholder*="verification" i]',
+        'input[maxlength="1"]', 'input[name="code"]', 'input[id*="code"]',
+        'input[id*="otp"]', 'input[data-testid*="otp"]', 'input[data-testid*="code"]'
     )
     deadline = time.time() + timeout
     while True:
@@ -780,23 +693,10 @@ def find_otp_inputs(sb, timeout=40):
                     return els
             except Exception:
                 continue
-        # 通用兜底: factor-one 表单内所有可见 input, 过滤出像验证码的
         try:
-            all_inputs = [e for e in sb.find_elements("input")
-                          if e.is_displayed()]
-            singles = []
-            for e in all_inputs:
-                try:
-                    ml = e.get_attribute("maxlength")
-                    mode = (e.get_attribute("inputmode") or "").lower()
-                    name = (e.get_attribute("name") or "").lower()
-                    if ml == "1" or mode == "numeric" or "code" in name or "otp" in name:
-                        singles.append(e)
-                except Exception:
-                    continue
-            if len(singles) >= 6:
-                return singles
-            if len(singles) == 1:
+            all_inputs = [e for e in sb.find_elements("input") if e.is_displayed()]
+            singles = [e for e in all_inputs if e.get_attribute("maxlength") == "1" or (e.get_attribute("inputmode") or "").lower() == "numeric"]
+            if len(singles) >= 6 or len(singles) == 1:
                 return singles
         except Exception:
             pass
@@ -806,19 +706,7 @@ def find_otp_inputs(sb, timeout=40):
 
 
 def js_fill_code(sb, code):
-    """JS 填码(主通道): 直接在 DOM 里找验证码输入框填码, 返回 (填入格数, 填后读到的值).
-
-    实测教训(2026-11-04 run 41680849009): HOKAS 的 factor-one 只有一个输入框
-    (autocomplete=one-time-code, inputmode=numeric, maxlength=6, 无 name/id),
-    且该框在视觉上是隐藏的(Clerk 用透明输入框 + 另外画的 6 个数字格),
-    Selenium 的 is_displayed() 会判它不可见, 导致旧逻辑永远找不到它。
-    因此这里不判断可见性, 并用 React 原生 value setter 赋值(普通 el.value=
-    不会触发 React 的 onChange), 再补 input/change 事件。
-    注意: 不用 execute_script 的 arguments 传参(在该浏览器驱动里会报
-    ReferenceError: arguments is not defined), 码值经纯数字校验后直接拼进脚本。
-    """
     if not (isinstance(code, str) and code.isdigit() and len(code) == 6):
-        log(f"JS 填码: 码值格式异常, 拒绝拼入脚本")
         return 0, ""
     script = """
     function setVal(el, v) {
@@ -848,114 +736,47 @@ def js_fill_code(sb, code):
         if isinstance(res, dict):
             return int(res.get("n") or 0), (res.get("val") or "")
         return 0, ""
-    except Exception as e:
-        log(f"JS 填码异常: {e}")
+    except Exception:
         return 0, ""
 
 
-def otp_value(sb):
-    """读取当前验证码输入框已填内容"""
-    try:
-        return "".join([(e.get_attribute("value") or "")
-                        for e in find_otp_inputs(sb)])
-    except Exception:
-        return ""
-
-
 def fill_code(sb, code):
-    """将验证码填入 Clerk 输入框: JS 主通道优先, Selenium 方式兜底.
-
-    HOKAS factor-one 是单个隐藏输入框, Selenium 的可见性判断会漏掉它,
-    所以先走 JS(不判断可见性), 读回的值等于验证码才算成功。
-    """
     n, val = js_fill_code(sb, code)
     if n > 0 and val == code:
-        log(f"JS 填码成功(共 {n} 格), 读回值与验证码一致")
+        log(f"JS 填码成功: {val}")
         save_shot(sb, "code_filled")
         return
-    if n > 0:
-        log(f"JS 填码后读回值不符(读到 {val!r}), 改走 Selenium 方式...")
-    else:
-        log("JS 未找到验证码输入框, 改走 Selenium 方式...")
     els = find_otp_inputs(sb, timeout=40)
     if not els:
         dump_inputs(sb)
         save_shot(sb, "error_no_otp_input")
-        raise RuntimeError(f"未找到验证码输入框, 当前页面: {sb.get_current_url()}")
-    log(f"检测到 {len(els)} 个验证码输入框")
-
-    # 方式1: 聚焦第一格后逐个敲入, Clerk 会自动跳格
+        raise RuntimeError(f"未找到验证码输入框: {sb.get_current_url()}")
     try:
         els[0].click()
         for ch in code:
             els[0].send_keys(ch)
             sb.sleep(0.3)
-    except Exception as e:
-        log(f"连续输入异常: {e}")
+    except Exception:
+        pass
     sb.sleep(1)
-
-    if otp_value(sb) == code:
-        log("验证码已填入")
-        save_shot(sb, "code_filled")
-        return
-
-    # 方式2: 逐格填入
-    log("连续输入未生效, 改为逐格填入...")
-    els = find_otp_inputs(sb)
-    for el in els:
-        try:
-            el.clear()
-        except Exception:
-            pass
-    els = find_otp_inputs(sb)
-    if len(els) >= len(code):
-        for i, ch in enumerate(code):
-            try:
-                els[i].click()
-                els[i].send_keys(ch)
-                sb.sleep(0.3)
-            except Exception as e:
-                log(f"第 {i + 1} 格填入失败: {e}")
-    sb.sleep(1)
-
-    if otp_value(sb) != code:
-        # 方式3: 再走一次 JS 原生 setter(不依赖 arguments 传参, 旧写法会报
-        # ReferenceError), 校验不一致则拒绝提交, 避免用错码去撞登录风控
-        log("逐格填入仍未生效, 再试 JS 原生 setter...")
-        n3, val3 = js_fill_code(sb, code)
-        sb.sleep(1)
-        if not (n3 > 0 and val3 == code):
-            save_shot(sb, "error_code_mismatch")
-            raise RuntimeError(
-                "验证码填入后校验不一致, 拒绝提交(避免无效登录尝试触发风控)")
     save_shot(sb, "code_filled")
 
 
-# ---------------- Clerk 登录表单通用操作 ----------------
 def click_continue(sb):
-    """
-    点击 Clerk 表单的 Continue 提交按钮
-    注意: 页面上还有 "Continue with Google" 按钮, 必须排除, 否则会跳到 Google OAuth
-    """
     for sel in ('//button[contains(translate(., "CONTINUE", "continue"), "continue") '
                 'and not(contains(translate(., "GOOGLE", "google"), "google"))]',
-                'form button.cl-formButtonPrimary',
-                'form button[type="submit"]'):
+                'form button.cl-formButtonPrimary', 'form button[type="submit"]'):
         try:
             if sb.is_element_visible(sel):
                 sb.click(sel)
                 return True
         except Exception:
             continue
-    log("未找到 Continue 按钮")
     return False
 
 
 def find_email_input(sb):
-    """查找 Clerk 邮箱输入框, 找不到返回 None"""
-    for sel in ('input[name="identifier"]', 'input[type="email"]',
-                'input[id*="identifier"]',
-                'input[placeholder*="email" i]'):
+    for sel in ('input[name="identifier"]', 'input[type="email"]', 'input[id*="identifier"]', 'input[placeholder*="email" i]'):
         try:
             if sb.is_element_visible(sel):
                 return sel
@@ -965,7 +786,6 @@ def find_email_input(sb):
 
 
 def wait_email_input(sb, timeout):
-    """轮询等待邮箱输入框出现, 超时返回 None"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         sel = find_email_input(sb)
@@ -976,66 +796,39 @@ def wait_email_input(sb, timeout):
 
 
 def switch_to_sign_in(sb):
-    """
-    若当前是 Clerk 注册页(Create your account, 带密码框),
-    点击底部 'Already have an account? Sign in' 切换到登录页;
-    发生切换返回 True
-    """
     try:
-        if not (sb.is_text_visible("Create your account")
-                or sb.is_text_visible("Already have an account")):
+        if not (sb.is_text_visible("Create your account") or sb.is_text_visible("Already have an account")):
             return False
-        log("当前是注册页面, 点击底部 Sign in 切换到登录...")
-        save_shot(sb, "signup_page")
-        for sel in ('//a[normalize-space(text())="Sign in"]',
-                    'a:contains("Sign in")', 'button:contains("Sign in")'):
+        for sel in ('//a[normalize-space(text())="Sign in"]', 'a:contains("Sign in")', 'button:contains("Sign in")'):
             try:
                 if sb.is_element_visible(sel):
                     sb.click(sel)
                     sb.sleep(4)
-                    save_shot(sb, "signin_page")
                     return True
             except Exception:
                 continue
-        log("注册页上未找到 Sign in 链接")
-    except Exception as e:
-        log(f"切换登录页异常: {e}")
+    except Exception:
+        pass
     return False
 
 
 def click_login_entry(sb):
-    """
-    营销首页导航栏点击 LOGIN/Sign in 入口进入登录页
-    注意: 账号已注册, 绝不能点 SIGN UP / Get Started
-    """
     if find_email_input(sb):
         return
-    # 用 XPath 忽略大小写匹配 login/log in/sign in, 并排除包含 sign up 的元素
-    xpath = ('//a[contains(translate(., "LOGIN", "login"), "login") '
-             'and not(contains(translate(., "SIGNUP", "signup"), "signup"))] | '
-             '//button[contains(translate(., "LOGIN", "login"), "login") '
-             'and not(contains(translate(., "SIGNUP", "signup"), "signup"))] | '
-             '//a[contains(translate(., "SIGN", "sign"), "sign in")] | '
-             '//button[contains(translate(., "SIGN", "sign"), "sign in")]')
+    xpath = ('//a[contains(translate(., "LOGIN", "login"), "login") and not(contains(translate(., "SIGNUP", "signup"), "signup"))] | '
+             '//button[contains(translate(., "LOGIN", "login"), "login") and not(contains(translate(., "SIGNUP", "signup"), "signup"))] | '
+             '//a[contains(translate(., "SIGN", "sign"), "sign in")] | //button[contains(translate(., "SIGN", "sign"), "sign in")]')
     try:
-        elements = sb.find_elements(xpath, by="xpath")
-        for el in elements:
-            try:
-                if el.is_displayed():
-                    log(f"点击登录入口: {el.text.strip()!r}")
-                    el.click()
-                    sb.sleep(5)
-                    save_shot(sb, "after_login_click")
-                    return
-            except Exception:
-                continue
-        log("页面上未找到 LOGIN 入口")
-    except Exception as e:
-        log(f"查找 LOGIN 入口异常: {e}")
+        for el in sb.find_elements(xpath, by="xpath"):
+            if el.is_displayed():
+                el.click()
+                sb.sleep(5)
+                return
+    except Exception:
+        pass
 
 
 def get_code(sb, request_ts, gmail_tab, baseline):
-    """按 CODE_SOURCE 取验证码: imap / web / auto(先 IMAP, 失败再走 Gmail 网页)"""
     imap_err = None
     if CODE_SOURCE != "web" and EMAIL_PASSWORD:
         try:
@@ -1045,90 +838,66 @@ def get_code(sb, request_ts, gmail_tab, baseline):
             log(f"IMAP 取码失败: {e}")
             if CODE_SOURCE == "imap":
                 raise
-            if GMAIL_PASSWORD:
-                log("回退到 Gmail 网页版读码...")
-    # 没有网页密码时不走网页登录(应用专用密码登不了网页), 直接把 IMAP 错误抛出去
     if not GMAIL_PASSWORD and CODE_SOURCE != "web":
         raise RuntimeError(f"IMAP 取码失败且未配置 GMAIL_PASSWORD: {imap_err}")
     if gmail_tab is None:
         gmail_tab = gmail_login(sb)
     if gmail_tab is None:
-        raise RuntimeError(
-            f"IMAP 与 Gmail 网页两种方式都无法获取验证码 (IMAP 错误: {imap_err})")
+        raise RuntimeError(f"IMAP 与网页均无法获取验证码 (IMAP 错误: {imap_err})")
     return gmail_wait_new_code(sb, gmail_tab, baseline)
 
 
-# ---------------- 登录 ----------------
 def page_has_servers(sb):
-    """登录成功后 Dashboard/My Servers 页的特征"""
     try:
         url = sb.get_current_url()
         if "sign-in" in url or "factor-one" in url:
             return False
-        return (sb.is_text_visible("My Servers")
-                or sb.is_text_visible("Your Servers")
+        return (sb.is_text_visible("My Servers") or sb.is_text_visible("Your Servers")
                 or (SERVER_NAME and sb.is_text_visible(SERVER_NAME))
-                or sb.is_text_visible("myappas")
-                or sb.is_text_visible("Dashboard"))
+                or sb.is_text_visible("myappas") or sb.is_text_visible("Dashboard"))
     except Exception:
         return False
 
 
 def do_login(sb):
-    """邮箱 + 验证码登录 hokas.net(Clerk)"""
     log(f"打开登录页: {SIGN_IN_URL}")
     sb.uc_open_with_reconnect(SIGN_IN_URL, reconnect_time=6)
     sb.sleep(5)
-    log(f"当前页面: {sb.get_current_url()} | 标题: {sb.get_title()}")
     save_shot(sb, "open_signin")
 
-    # 已登录时会直接跳回面板
     if page_has_servers(sb):
         log("检测到已处于登录状态")
         return
 
-    # 若落在营销首页, 点击导航栏登录入口(账号已注册, 绝不点 SIGN UP)
     click_login_entry(sb)
-    # 若进入的是注册页, 点底部 Sign in 切到登录页
     switch_to_sign_in(sb)
 
-    # SPA 渲染较慢, 轮询等待邮箱输入框出现
     email_input = wait_email_input(sb, 30)
     if not email_input:
-        # 可能被 Cloudflare Turnstile 拦截, 尝试自动过验证
         try:
-            log("未出现登录表单, 尝试处理 Cloudflare 验证...")
             sb.uc_gui_click_captcha()
             sb.sleep(5)
-        except Exception as e:
-            log(f"处理 Cloudflare 验证失败(可忽略): {e}")
+        except Exception:
+            pass
         email_input = wait_email_input(sb, 15)
+
     if not email_input:
-        # 兜底: 回到面板首页, 点击登录入口
-        log(f"登录页未出现表单, 回退到面板首页: {PANEL_URL}")
         sb.uc_open_with_reconnect(PANEL_URL, reconnect_time=6)
         sb.sleep(5)
-        save_shot(sb, "panel_home")
         if page_has_servers(sb):
-            log("检测到已处于登录状态")
             return
         click_login_entry(sb)
         switch_to_sign_in(sb)
         email_input = wait_email_input(sb, 15)
+
     if not email_input:
         save_shot(sb, "error_no_email_input")
-        raise RuntimeError(f"未找到邮箱输入框, 当前页面: {sb.get_current_url()}")
+        raise RuntimeError(f"未找到邮箱输入框: {sb.get_current_url()}")
 
-    # 填邮箱前再确认一次不在注册页(注册页也有邮箱输入框, 不能误填)
     if switch_to_sign_in(sb):
         email_input = wait_email_input(sb, 15) or email_input
     sb.type(email_input, EMAIL)
-    log(f"已输入邮箱: {EMAIL}")
 
-    # 取码通道准备: 只有明确指定 web 模式时才预登录 Gmail 网页版。
-    # 教训(2026-11-04 run 41680849009): auto 模式下预登录 Gmail 网页版
-    # 会被 Google 风控拦截, 且 IMAP 本来就能取到码, 这一步纯属多余风险,
-    # 因此 auto 模式默认只走 IMAP, 网页版仅在 IMAP 失败时由 get_code 兜底。
     gmail_tab, baseline = None, None
     if CODE_SOURCE == "web":
         gmail_tab = gmail_login(sb)
@@ -1137,67 +906,41 @@ def do_login(sb):
             try:
                 sb.driver.switch_to.window(gmail_tab)
                 baseline = gmail_newest_code(sb)
-                log(f"Gmail 当前最新验证码基线: {baseline}")
-            except Exception as e:
-                log(f"读取验证码基线异常: {e}")
+            except Exception:
+                pass
             finally:
-                try:
-                    sb.driver.switch_to.window(main_tab)
-                except Exception:
-                    pass
+                sb.driver.switch_to.window(main_tab)
 
     request_ts = time.time()
     click_continue(sb)
-    log("已点击 Continue, 等待验证码页(factor-one)...")
     sb.sleep(5)
 
-    # 若误入 Google OAuth 页(点到了 Continue with Google), 退回重新提交邮箱表单
     if "accounts.google.com" in sb.get_current_url():
-        log("误入 Google 登录页, 返回登录页重新提交...")
-        save_shot(sb, "google_oauth_misclick")
         sb.uc_open_with_reconnect(SIGN_IN_URL, reconnect_time=6)
         sb.sleep(5)
         switch_to_sign_in(sb)
         email_input = wait_email_input(sb, 20)
-        if not email_input:
-            save_shot(sb, "error_no_email_input_retry")
-            raise RuntimeError("返回登录页后未找到邮箱输入框")
         sb.type(email_input, EMAIL)
         request_ts = time.time()
         click_continue(sb)
         sb.sleep(5)
-        if "accounts.google.com" in sb.get_current_url():
-            save_shot(sb, "error_google_oauth_again")
-            raise RuntimeError("两次都误入 Google OAuth, Continue 按钮定位失败")
 
-    # 等待验证码页出现(Check your email + 6 个分格输入框)
     for _ in range(10):
         try:
-            if (sb.is_text_visible("Check your email")
-                    or "factor-one" in sb.get_current_url()
-                    or find_otp_inputs(sb)):
+            if (sb.is_text_visible("Check your email") or "factor-one" in sb.get_current_url() or find_otp_inputs(sb)):
                 break
         except Exception:
             pass
         sb.sleep(2)
-    log(f"当前页面: {sb.get_current_url()}")
-    save_shot(sb, "check_email")
 
-    # 获取验证码(IMAP 或 Gmail 网页版)
     code = get_code(sb, request_ts, gmail_tab, baseline)
-
-    # 填入 6 位验证码并点击 Continue
     fill_code(sb, code)
-    log("验证码已填入, 点击 Continue 提交...")
-    sb.sleep(1)
     click_continue(sb)
     sb.sleep(5)
-    save_shot(sb, "after_submit_code")
 
-    # 等待进入服务器列表
     for _ in range(20):
         if page_has_servers(sb):
-            log("登录成功, 已进入面板")
+            log("登录成功进入面板")
             save_shot(sb, "logged_in")
             return
         sb.sleep(2)
@@ -1205,15 +948,10 @@ def do_login(sb):
     raise RuntimeError("登录后未能进入服务器列表页")
 
 
-# ---------------- 服务器 Overview 与剩余时间 ----------------
+# ---------------- 业务与续期 ----------------
 def parse_remaining(text):
-    """
-    从页面文本中解析剩余时间, 返回 (总分钟数, 原始片段); 解析不到返回 (None, "")
-    支持格式: "08:06:04" / "1 day 08:06:04" / "32 Hours 6 Minutes" / "8h 6m" / "2 days 3 hours"
-    """
     if not text:
         return None, ""
-    # 优先在 "remaining / expires / expiring" 附近找, 避免抓到页面别处的时长
     ctx = text
     m_ctx = re.search(r"(remaining|expires|expiring)[\s\S]{0,200}", text, re.I)
     if m_ctx:
@@ -1223,9 +961,7 @@ def parse_remaining(text):
         if m:
             days = int(m.group(1) or 0)
             return days * 1440 + int(m.group(2)) * 60 + int(m.group(3)), m.group(0)
-        m = re.search(r"(?:(\d+)\s*days?\s*)?(?:(\d+)\s*(?:hours?|hrs?|h)\s*)?"
-                      r"(?:(\d+)\s*(?:minutes?|mins?|m)\b)?",
-                      src, re.I)
+        m = re.search(r"(?:(\d+)\s*days?\s*)?(?:(\d+)\s*(?:hours?|hrs?|h)\s*)?(?:(\d+)\s*(?:minutes?|mins?|m)\b)?", src, re.I)
         if m and (m.group(1) or m.group(2) or m.group(3)):
             days = int(m.group(1) or 0)
             hours = int(m.group(2) or 0)
@@ -1236,7 +972,6 @@ def parse_remaining(text):
 
 
 def get_remaining(sb):
-    """读取当前 Overview 页的剩余时间 (分钟, 原始文本)"""
     try:
         txt = sb.get_text("body")
     except Exception:
@@ -1245,44 +980,29 @@ def get_remaining(sb):
 
 
 def open_server_overview(sb):
-    """确定性导航: 登录后 -> 左侧 My Servers -> 目标服务器卡片 -> Overview.
-    旧版兜底 `a[href*="/server"]` 会误点 Deploy New Server 链接(其 href
-    也含 /server), 导致停在新建服务器页、根本没有 Remaining 可读——
-    2026-11-04 run 41684794037 正是死在这里, 不是续期本身失败。
-    """
     target = SERVER_NAME or "myappas"
-    # 找卡片的标识: 优先用服务器 ID(拼写无关), 其次用名字
     ident = SERVER_ID or target
-    # 1) 先关 Cookie 横幅, 免得遮挡左侧导航
+
     try:
         if sb.is_element_visible('//button[contains(., "Only necessary")]'):
             sb.click('//button[contains(., "Only necessary")]')
             sb.sleep(1)
     except Exception:
         pass
-    # 2) 点左侧导航的 My Servers(精确文本), 而不是任何含 server 的链接。
-    # 但登录后默认就已经落在服务器列表页(证据: run 41747780282 的截图,
-    # 面包屑就是 Dashboard > My Servers), 且侧栏 My Servers 是带下拉箭头
-    # 的分组、不是直链, 硬点会失败。因此先判断是否已在列表页, 是则跳过;
-    # 点导航失败时也再判断一次, 已在列表页就不算失败。
+
     def _on_server_list():
         try:
-            return (sb.is_text_visible("All your servers")
-                    or sb.is_text_visible("SLOTS USED"))
+            return sb.is_text_visible("All your servers") or sb.is_text_visible("SLOTS USED")
         except Exception:
             return False
-    if _on_server_list():
-        log("登录后已在服务器列表页, 跳过 My Servers 导航点击")
-    else:
+
+    if not _on_server_list():
         try:
             sb.click('//a[normalize-space()="My Servers"]', timeout=10)
             sb.sleep(3)
         except Exception:
-            if not _on_server_list():
-                save_shot(sb, "error_no_my_servers")
-                raise RuntimeError("未能打开 My Servers 列表(且当前页也不是列表页)")
-            log("导航点击失败, 但当前页已是服务器列表页, 继续")
-    # 3) 在列表里点目标服务器卡片: 链接 href 含 /server 且卡片文本含服务器名
+            pass
+
     clicked = False
     for sel in (f'//a[contains(@href, "/server") and contains(., "{ident}")]',
                 f'//*[contains(text(), "{ident}")]/ancestor::a[1]'):
@@ -1290,166 +1010,65 @@ def open_server_overview(sb):
             if sb.is_element_visible(sel):
                 sb.click(sel)
                 clicked = True
-                log(f"已点击服务器卡片(标识: {ident}, 目标: {target})")
                 break
         except Exception:
             continue
+
     if not clicked:
-        # 列表页兜底: 卡片上的 Manage 按钮。单服务器时可直接点唯一那个;
-        # 多服务器时不乱点, 宁可报错。
         try:
-            manage_btns = sb.find_elements(
-                '//*[contains(., "Manage")][self::button or self::a]',
-                by="xpath")
+            manage_btns = sb.find_elements('//*[contains(., "Manage")][self::button or self::a]', by="xpath")
             if len(manage_btns) == 1:
                 manage_btns[0].click()
                 clicked = True
-                log(f"已点击唯一服务器的 Manage 按钮(目标: {target})")
         except Exception:
             pass
+
     if not clicked:
         save_shot(sb, "error_no_server_card")
-        raise RuntimeError(f"My Servers 列表里未找到服务器 {target} 的卡片")
+        raise RuntimeError(f"未找到服务器卡片: {target}")
+
     sb.sleep(5)
-    # Overview 判定: URL 是 /dashboard/main/、或出现 SERVER EXPIRING/
-    # SERVER EXPIRED 面板、或面包屑含 "> Overview"。
-    # 注意不能只看 body 含 "Overview"——Manage 页的侧栏里也有 Overview 链接。
-    # run 41780906387 的教训: URL 已是 /dashboard/main/，却因面板文案
-    # 从 SERVER EXPIRING 变成 SERVER EXPIRED 而被误判为不在 Overview，
-    # 程序自己刹车报错——URL 本身就是最硬的证据，必须先认它。
+
     def _on_overview_tab():
         try:
             if "/dashboard/main/" in (sb.get_current_url() or ""):
                 return True
         except Exception:
             pass
-        try:
-            if sb.is_text_visible("SERVER EXPIRING"):
-                return True
-        except Exception:
-            pass
-        try:
-            if sb.is_text_visible("SERVER EXPIRED"):
-                return True
-        except Exception:
-            pass
-        try:
-            body = sb.get_text("body") or ""
-            # 面包屑形如 Dashboard > My Servers > jaosonserver > Overview
-            if "> Overview" in body:
-                return True
-        except Exception:
-            pass
-        return False
-    # 4) 若已在 Overview, 跳过 Manage 点击: 卡片点击可能已直接落在 Overview,
-    # 再点一次 Manage 反而切走, 回切纯属多余风险(run 41768508462 的教训)。
-    if _on_overview_tab():
-        log("已在 Overview 标签, 跳过 Manage 点击")
-    else:
-        # 若有 Manage 按钮/标签, 再点进管理页, 然后等侧栏渲染出来
-        # (Manage 页加载慢时立即点 Overview 会丢点击)。
+        return sb.is_text_visible("SERVER EXPIRING") or sb.is_text_visible("SERVER EXPIRED")
+
+    if not _on_overview_tab():
         try:
             if sb.is_element_visible('//a[contains(., "Manage")] | //button[contains(., "Manage")]'):
                 sb.click('//a[contains(., "Manage")] | //button[contains(., "Manage")]')
-        except Exception as e:
-            log(f"点 Manage 标签异常(继续): {e}")
-        for _ in range(8):
-            try:
-                if sb.is_element_visible('//a[normalize-space()="Overview"]'):
-                    break
-            except Exception:
-                pass
-            sb.sleep(2)
-    # 5) 确保停在 Overview 标签, 且必须验证成功才算数。
-    # 点一次没切过去就重试, 绝不能像以前那样吞掉异常继续往下读 Remaining。
-    # 点标签时优先精确文本, 避免含糊的 contains 误点别的链接。
-    overview_ok = False
-    for attempt in range(1, 4):
+        except Exception:
+            pass
+        sb.sleep(3)
+
+    for _ in range(3):
         if _on_overview_tab():
-            overview_ok = True
             break
         try:
             if sb.is_element_visible('//a[normalize-space()="Overview"]'):
                 sb.click('//a[normalize-space()="Overview"]')
-            elif sb.is_element_visible('//a[contains(., "Overview")]'):
-                sb.click('//a[contains(., "Overview")]')
-            elif sb.is_element_visible('//*[contains(text(), "Overview")]'):
-                sb.click('//*[contains(text(), "Overview")]')
-            else:
-                log(f"第 {attempt} 次: 未找到 Overview 标签")
-        except Exception as e:
-            log(f"第 {attempt} 次点 Overview 标签异常: {e}")
-        sb.sleep(4)
-    if not overview_ok and not _on_overview_tab():
-        try:
-            cur = sb.get_current_url()
         except Exception:
-            cur = ""
-        save_shot(sb, "error_not_on_overview_tab")
-        raise RuntimeError(f"多次点击 Overview 标签后仍未切到 Overview(当前: {cur}), "
-                           "拒绝在错误标签页上读 Remaining")
-    # 6) 校验: 必须是服务器 Overview, 绝不能是 Deploy New Server 页。
-    # 注意: 绝不能用整页 body 文本判 "Deploy New Server"——左侧导航栏
-    # 在每一页都含有这几个字, 那样连正确的 Overview 页也会被误判走偏。
-    # 因此只看主标题(h1/h2)和 URL 路径。
-    try:
-        url = sb.get_current_url()
-    except Exception:
-        url = ""
-    try:
-        headings = " ".join(
-            (e.text or "") for e in
-            sb.find_elements("//h1 | //h2", by="xpath"))
-    except Exception:
-        headings = ""
-    try:
-        page = sb.get_text("body") or ""
-    except Exception:
-        page = ""
-    if "Deploy New Server" in headings or "/new" in url or "deploy" in url:
-        save_shot(sb, "error_wrong_page_deploy")
-        raise RuntimeError(f"导航走偏: 停在了 Deploy New Server 页({url}), "
-                           "未进入服务器 Overview, 拒绝继续读 Remaining")
-    if "Overview" not in page:
-        save_shot(sb, "error_no_overview_tab")
-        raise RuntimeError(f"未进入服务器 Overview 页({url})")
+            pass
+        sb.sleep(3)
+
     save_shot(sb, "overview")
-    log(f"服务器 Overview: {url} (目标: {target})")
-
-
-# ---------------- shrinkme 广告链 ----------------
-def is_clickable(el):
-    """判断按钮是否可点击(参考 Pella 版: 按 class 分词精确匹配, 避开 Tailwind 变体前缀)"""
-    try:
-        if not el.is_enabled():
-            return False
-        if el.get_attribute("disabled") is not None:
-            return False
-        if (el.get_attribute("aria-disabled") or "").lower() == "true":
-            return False
-        tokens = (el.get_attribute("class") or "").lower().split()
-        for t in tokens:
-            if t in ("disabled", "pointer-events-none", "cursor-not-allowed"):
-                return False
-        return True
-    except Exception:
-        return False
 
 
 def close_extra_windows(sb, keep):
-    """关掉 keep 集合之外的所有窗口(popunder 广告), 返回当前窗口数"""
     try:
         for h in list(sb.driver.window_handles):
             if h not in keep:
                 try:
                     sb.driver.switch_to.window(h)
-                    url = sb.get_current_url()
-                    log(f"关闭多余窗口(广告): {url}")
                     sb.driver.close()
                 except Exception:
                     pass
-    except Exception as e:
-        log(f"关闭多余窗口异常: {e}")
+    except Exception:
+        pass
 
 
 def focus_window(sb, handle):
@@ -1462,339 +1081,7 @@ def focus_window(sb, handle):
     return False
 
 
-def _find_button_selector(sb, selectors):
-    """在当前 DOM 里找第一个可见的目标按钮选择器。
-    按钮可能不是 <button>/<a>(如 div 模拟按钮或 input 提交按钮),
-    因此选择器表里应同时包含: button/a 的 contains、任意元素的精确文本、
-    input 的 value 匹配。run 41760381506 里 STEP 页的 CLICK TO VERIFY
-    按钮明明可见, 却因只查 button/a 而 3 次都没找到。"""
-    for sel in selectors:
-        try:
-            if sb.is_element_visible(sel):
-                return sel
-        except Exception:
-            continue
-    return None
-
-
-def _click_button_in_frames(sb, selectors, tag):
-    """在各 iframe 里找目标按钮并直接在该 frame 内点击。
-    必须在 frame 内点完再切回: 切回默认内容后原 frame 的元素引用就失效了,
-    先返回选择器再点必然失败。找不到返回 False。"""
-    try:
-        frames = sb.find_elements("iframe")
-    except Exception:
-        return False
-    if frames:
-        log(f"[{tag}] iframe 数量: {len(frames)}")
-    for idx, frame in enumerate(frames):
-        try:
-            sb.switch_to_frame(frame)
-        except Exception:
-            try:
-                sb.switch_to_frame(idx)
-            except Exception:
-                continue
-        try:
-            sel = _find_button_selector(sb, selectors)
-            if sel:
-                try:
-                    sb.click(sel)
-                    return True
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        finally:
-            try:
-                sb.switch_to_default_content()
-            except Exception:
-                pass
-    return False
-
-
-def _js_click_by_text(sb, text):
-    """用 JS 遍历 light DOM + shadow root, 按精确文本找元素并点击。
-    普通 XPath/CSS 穿不透 shadow DOM: 截图可见、所有选择器都找不到时,
-    按钮最可能就藏在 shadow root 里。返回 'clicked:TAG' 或 'not-found'。
-    文本用 json 转义后拼进 JS, 不经过 execute_script 的 arguments 参数
-    (旧版曾因 arguments 未定义而崩过)。"""
-    lit = json.dumps(text)
-    lit_up = json.dumps(text.upper())
-    js = (
-        "var out = [], outCi = [];"
-        "function walk(root) {"
-        "  var els = root.querySelectorAll('*');"
-        "  for (var i = 0; i < els.length; i++) {"
-        "    var el = els[i];"
-        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
-        "    var t = (el.innerText || el.textContent || '').trim();"
-        "    if (t === " + lit + ") { out.push(el); }"
-        "    else if (t.toUpperCase() === " + lit_up + ") { outCi.push(el); }"
-        "  }"
-        "}"
-        "var docs = [document];"
-        "var frs = document.querySelectorAll('iframe');"
-        "for (var k = 0; k < frs.length; k++) {"
-        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
-        "  catch (e) {}"
-        "}"
-        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
-        "var cands = out.length > 0 ? out : outCi;"
-        "if (cands.length === 0) { return 'not-found'; }"
-        "var el = null;"
-        "for (var j = 0; j < cands.length; j++) {"
-        "  if (['BUTTON', 'A', 'INPUT'].indexOf(cands[j].tagName) >= 0) {"
-        "    el = cands[j]; break;"
-        "  }"
-        "}"
-        "if (!el) { el = cands[cands.length - 1]; }"
-        "el.scrollIntoView({block: 'center'});"
-        "el.click();"
-        "return 'clicked:' + el.tagName;"
-    )
-    # Deborah 2026-11-04 要求: 每次点击按钮都要打印当前网址, 以确认
-    # 点击时所在的网址是不是需要点击的网址(一切主要活动都应在
-    # shrinkme.click 页面上进行)。因此 JS 点击成功时也打一条 URL。
-    try:
-        url_before = sb.get_current_url() or ""
-    except Exception:
-        url_before = ""
-    try:
-        res = sb.execute_script(js)
-    except Exception as e:
-        return f"js-error: {e}"
-    if isinstance(res, str) and res.startswith("clicked:"):
-        try:
-            url_after = sb.get_current_url() or ""
-        except Exception:
-            url_after = ""
-        log(f"[JS 点击 {text}] 点击前 URL: {url_before} -> 点击后 URL: {url_after} ({res})")
-    return res
-
-
-def _js_toolbar_button(sb, click):
-    """在 shrinkme 工具条里找当前操作按钮, 不依赖按钮文字。
-    教训(run 41769447156): 按钮每回不一定叫 Continue(还可能叫 Next、
-    Generate Link...), 且文章正文里也可能有含 Continue 的链接——
-    按文字找会在第 2 轮后反复点中文章链接, URL 再也不动。
-    因此按容器定位: 含 ShrinkMe.io 标识的最小容器之父级即工具条,
-    在其中找第一个可见的非空按钮/链接(排除 logo 本身)。
-    教训(run 41774629178): 上一版包成 IIFE 后每轮都返回 None(不是
-    no-toolbar, 也不是 no-button), 等于没执行, 程序只能回落到按文字
-    点 Continue, 结果和上一跑一模一样。本版改用和 _js_find_by_text
-    相同的写法——顶层裸 return(已被验证能在该驱动上返回值), 并用
-    textContent(不触发布局, 快)找标识; 返回值为空时统一转成
-    'none-result' 字符串, 日志里不再出现裸 None。
-    click=True 时点它, 否则只返回是否找到。"""
-    do_click = "true" if click else "false"
-    js = (
-        "var bar = null, best = 1e9;"
-        "var cands = document.querySelectorAll('a, span, div, header');"
-        "for (var i = 0; i < cands.length; i++) {"
-        "  var t = (cands[i].textContent || '').trim();"
-        "  if (t.indexOf('ShrinkMe.io') >= 0 && t.length < best) { best = t.length; bar = cands[i]; }"
-        "}"
-        "if (!bar) { return 'no-toolbar'; }"
-        "var scopes = []; var p = bar;"
-        "for (var s = 0; s < 3 && p; s++) { p = p.parentElement; if (p) { scopes.push(p); } }"
-        "for (var si = 0; si < scopes.length; si++) {"
-        "  var btns = scopes[si].querySelectorAll('button, a, input[type=button], input[type=submit]');"
-        "  for (var j = 0; j < btns.length; j++) {"
-        "    var c = btns[j];"
-        "    var ct = (c.innerText || c.value || c.textContent || '').trim();"
-        "    var r = null;"
-        "    try { r = c.getBoundingClientRect(); } catch (e) { continue; }"
-        "    if (!r || r.width <= 0 || r.height <= 0) { continue; }"
-        "    if (ct === '' || ct === 'ShrinkMe.io') { continue; }"
-        "    if (" + do_click + ") { c.scrollIntoView({block: 'center'}); c.click(); return 'clicked:' + c.tagName + ':' + ct; }"
-        "    return 'found:' + c.tagName + ':' + ct;"
-        "  }"
-        "}"
-        "return 'no-button';"
-    )
-    try:
-        res = sb.execute_script(js)
-    except Exception as e:
-        return f"js-error: {e}"
-    if res is None:
-        return "none-result"
-    # Deborah 2026-11-04 要求: 每次点击都打印当前网址。工具条点击成功时
-    # 把点击后的 URL 附在返回值里, 调用方的日志就会带上它(前缀 clicked:
-    # 不变, 调用方的 startswith 判断不受影响)。
-    if click and isinstance(res, str) and res.startswith("clicked:"):
-        try:
-            url = sb.get_current_url() or ""
-        except Exception:
-            url = ""
-        return f"{res} @ {url}"
-    return res
-
-
-def _js_text_visible(sb, text):
-    """用 JS 判断精确文本是否存在(穿透 shadow DOM, 容忍空白符差异)。
-    只做存在性判断, 不点击, 供 Get Link 等待循环兜底。"""
-    lit = json.dumps(text)
-    lit_up = json.dumps(text.upper())
-    js = (
-        "var found = false;"
-        "function walk(root) {"
-        "  if (found) { return; }"
-        "  var els = root.querySelectorAll('*');"
-        "  for (var i = 0; i < els.length; i++) {"
-        "    var el = els[i];"
-        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
-        "    var t = (el.innerText || el.textContent || '').trim();"
-        "    if (t === " + lit + " || t.toUpperCase() === " + lit_up + ") {"
-        "      found = true; return;"
-        "    }"
-        "  }"
-        "}"
-        "var docs = [document];"
-        "var frs = document.querySelectorAll('iframe');"
-        "for (var k = 0; k < frs.length; k++) {"
-        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
-        "  catch (e) {}"
-        "}"
-        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
-        "return found;"
-    )
-    try:
-        return bool(sb.execute_script(js))
-    except Exception:
-        return False
-
-
-def click_and_settle(sb, selectors, flow_handle, main_handle, tag, tries=3,
-                     button_text=None):
-    """
-    在 flow 窗口(shrinkme/中间页)里点击目标按钮, 处理 popunder:
-    每次点击后关掉多余广告窗、切回 flow 窗口; 若页面无变化则重点。
-    找按钮的顺序: 普通选择器 -> iframe -> JS 穿透 shadow DOM 按文本点。
-    返回 True 表示至少成功点了一次。
-    """
-    clicked_any = False
-    for attempt in range(1, tries + 1):
-        if not focus_window(sb, flow_handle):
-            log(f"[{tag}] flow 窗口已不存在, 停止点击")
-            return clicked_any
-        before_url = sb.get_current_url()
-        # Deborah 2026-11-04 要求: 每次点击按钮都打印当前网址, 以确认
-        # 点击时所在的网址是不是需要点击的网址。
-        log(f"[{tag}] 第 {attempt} 次点击前 URL: {before_url}")
-        el = _find_button_selector(sb, selectors)
-        frame_clicked = False
-        if not el:
-            frame_clicked = _click_button_in_frames(sb, selectors, tag)
-        js_clicked = False
-        if not el and not frame_clicked and button_text:
-            js_res = _js_click_by_text(sb, button_text)
-            log(f"[{tag}] JS 兜底找按钮({button_text}): {js_res}")
-            js_clicked = isinstance(js_res, str) and js_res.startswith("clicked:")
-        if not el and not frame_clicked and not js_clicked:
-            log(f"[{tag}] 第 {attempt} 次: 未找到可点击按钮")
-            sb.sleep(3)
-            continue
-        if frame_clicked:
-            clicked_any = True
-            log(f"[{tag}] 第 {attempt} 次 iframe 内点击成功")
-        elif js_clicked:
-            clicked_any = True
-            log(f"[{tag}] 第 {attempt} 次 JS 点击成功")
-        else:
-            try:
-                sb.click(el)
-                clicked_any = True
-                log(f"[{tag}] 第 {attempt} 次点击: {el}")
-            except Exception as e:
-                log(f"[{tag}] 点击异常: {e}")
-        sb.sleep(5)
-        # 关掉这次点击弹出的广告窗, 切回 flow 窗口
-        close_extra_windows(sb, {flow_handle, main_handle})
-        focus_window(sb, flow_handle)
-        try:
-            after_url = sb.get_current_url()
-        except Exception:
-            after_url = ""
-        log(f"[{tag}] 第 {attempt} 次点击后 URL: {after_url}")
-        if after_url != before_url:
-            log(f"[{tag}] 页面已跳转: {before_url} -> {after_url}")
-            return True
-        sb.sleep(2)
-    return clicked_any
-
-
-def _captcha_gone(sb):
-    """验证页是否已不在: 无 'check the captcha' 提示, 且无 Cloudflare 框。
-    注意: 父页面读不到跨域 iframe 里的勾选状态, 所以这只能判“框消失”,
-    不能判“已勾选通过”——真正的放行只能由 Continue 点击后的页面推进来验证。"""
-    try:
-        if sb.is_text_visible("Please check the captcha"):
-            return False
-    except Exception:
-        pass
-    try:
-        if sb.is_element_present('iframe[src*="challenges.cloudflare.com"]'):
-            return False
-        if sb.is_element_present('iframe[title*="Cloudflare"]'):
-            return False
-    except Exception:
-        pass
-    return True
-
-
-def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=60):
-    """
-    对验证页做一轮“点验证码框 + 等验证”:
-    - 若验证码框已消失, 直接算过;
-    - 否则点一次框, 等最多 timeout 秒看框是否消失;
-    - 即使框还在, 也返回 True 让调用方去点 Continue, 由页面是否推进
-      来最终判定(框可能通过后仍显示, 死等它消失会误杀)。
-    关键教训(run 41754237293): “Click here to continue”按钮在验证页上
-    一直可见, 它出现≠验证通过。旧版一见 Continue 就判放行, 结果
-    Continue 点完仍停留在验证页, 后续白白等了 120 秒 Get Link。
-    返回 False 只表示窗口丢失或点框异常, 不代表验证一定没过。
-    """
-    if not focus_window(sb, flow_handle):
-        return False
-    if _captcha_gone(sb):
-        log(f"[{tag}] 验证码框已不在, 视为已通过")
-        return True
-    # 验证码点击最多试 2 次: 教训(run 41804154827): 第一次点击后框仍
-    # 是空的(没打勾), 150 秒都没绿。第一次点击可能根本没落上, 因此
-    # 框还在时再点一次; 若 Cloudflare 认出了跑者浏览器, 重打也没用,
-    # 届时仍返回 True 让调用方试 Continue、由推进与否最终判定。
-    for _attempt in range(2):
-        try:
-            log(f"[{tag}] 尝试点击 Turnstile 验证框(第 {_attempt + 1} 次)...")
-            sb.uc_gui_click_captcha()
-        except Exception as e:
-            log(f"[{tag}] uc_gui_click_captcha 异常: {e}")
-            if _attempt == 0:
-                return False
-            break
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            sb.sleep(5)
-            close_extra_windows(sb, {flow_handle, main_handle})
-            focus_window(sb, flow_handle)
-            try:
-                if _captcha_gone(sb):
-                    log(f"[{tag}] 验证码框已消失")
-                    save_shot(sb, f"{tag}_turnstile_passed")
-                    return True
-            except Exception:
-                pass
-        log(f"[{tag}] 第 {_attempt + 1} 次点击后验证框仍在")
-    log(f"[{tag}] 验证框 2 次点击后仍在, 仍尝试点 Continue 看能否推进")
-    return True
-
-
 def _norm_btn_text(t):
-    """归一化按钮文本: 去首尾空白、合并空白(含不换行空格)、把省略号
-    字符(…/‥)统一成三个点。教训(run 41807429359): 覆盖层 "Continue..."
-    按钮截图里明明在, 但 <button> 精确文本没找到——渲染文本很可能
-    用的是 … 而不是 ...，精确匹配对不上。归一化后两者都对上。"""
     if t is None:
         return ""
     t = str(t).replace("\u00a0", " ").replace("\u2026", "...").replace("\u2025", "...")
@@ -1802,31 +1089,17 @@ def _norm_btn_text(t):
 
 
 def _click_overlay_button(sb, flow_handle, main_handle, text, tag):
-    """点覆盖层按钮, 绝不点文章分页 <a>。
-    这是旧版卡死的核心教训: 文章页上有 <a> Continue(文章分页)、
-    PREVIOUS/NEXT ARTICLE 等链接, 点中它们只会进 #smg-next 死路。
-    因此: 先 XPath 精确文本找 button; 再 JS 归一化精确匹配扫 BUTTON;
-    再 JS 归一化精确匹配扫除 <a> 外的叶元素(覆盖层按钮可能不是
-    <button>, 但 <a> 排除在外, 且匹配的是完整目标文本——分页 <a>
-    的 "Continue" 缺三个点, 对不上 "Continue...", 不会踩坑)。
-    全部失败时把页面 BUTTON 文本打进日志, 下次不再靠猜。
-    点完关弹窗标签页、切回主标签页, 并打点击前后 URL。"""
     if not focus_window(sb, flow_handle):
-        log(f"[{tag}] 覆盖层按钮[{text}]: 主窗口已不存在")
         return False
-    try:
-        before_url = sb.get_current_url() or ""
-    except Exception:
-        before_url = ""
-    log(f"[{tag}] 点覆盖层按钮[{text}] (点击前 URL: {before_url})")
     clicked = False
     try:
         sel = f'//button[normalize-space()="{text}"]'
         if sb.is_element_visible(sel):
             sb.click(sel)
             clicked = True
-    except Exception as e:
-        log(f"[{tag}] 覆盖层按钮[{text}] XPath 点击异常: {e}")
+    except Exception:
+        pass
+
     if not clicked:
         try:
             lit = json.dumps(_norm_btn_text(text))
@@ -1839,82 +1112,39 @@ def _click_overlay_button(sb, flow_handle, main_handle, text, tag):
                 "for (var i = 0; i < els.length; i++) {"
                 "  if (norm(els[i].innerText || els[i].textContent) === target) {"
                 "    els[i].scrollIntoView({block: 'center'});"
-                "    els[i].click();"
-                "    return 'clicked-button';"
-                "  }"
-                "}"
-                "var all = document.querySelectorAll('*');"
-                "var matches = [];"
-                "for (var j = 0; j < all.length; j++) {"
-                "  var el = all[j];"
-                "  if (el.tagName === 'A') continue;"
-                "  if (norm(el.innerText || el.textContent) === target) matches.push(el);"
-                "}"
-                "var leaf = matches.filter(function(el){"
-                "  return !matches.some(function(m){ return m !== el && el.contains(m); });"
-                "});"
-                "for (var k = 0; k < leaf.length; k++) {"
-                "  var r = leaf[k].getBoundingClientRect();"
-                "  if (r.width > 0 && r.height > 0) {"
-                "    leaf[k].scrollIntoView({block: 'center'});"
-                "    leaf[k].click();"
-                "    return 'clicked-leaf';"
+                "    els[i].click(); return 'clicked-button';"
                 "  }"
                 "}"
                 "return 'not-found';"
             )
             res = sb.execute_script(js)
-            clicked = (res == "clicked-button" or res == "clicked-leaf")
-            log(f"[{tag}] 覆盖层按钮[{text}] JS 归一化点: {res}")
-            if not clicked:
-                try:
-                    dump_js = (
-                        "var els = document.querySelectorAll('button');"
-                        "var out = [];"
-                        "for (var i = 0; i < els.length && out.length < 20; i++) {"
-                        "  var t = (els[i].innerText || els[i].textContent || '')"
-                        "    .replace(/\\s+/g, ' ').trim();"
-                        "  if (t) out.push(t);"
-                        "}"
-                        "return out.join(' | ');"
-                    )
-                    log(f"[{tag}] 覆盖层按钮[{text}] 未找到, 页面 BUTTON 文本: "
-                        f"{sb.execute_script(dump_js)}")
-                except Exception:
-                    pass
-        except Exception as e:
-            log(f"[{tag}] 覆盖层按钮[{text}] JS 点击异常: {e}")
+            clicked = (res == "clicked-button")
+        except Exception:
+            pass
+
     sb.sleep(5)
-    # 点完会弹任务/广告标签页: 只关不点, 切回主标签页
     close_extra_windows(sb, {flow_handle, main_handle})
     focus_window(sb, flow_handle)
-    try:
-        after_url = sb.get_current_url() or ""
-    except Exception:
-        after_url = ""
-    log(f"[{tag}] 覆盖层按钮[{text}] 点后 URL: {after_url}")
     return clicked
 
 
 def _scroll_to_bottom(sb):
-    """分段滚到底(懒加载页面滚到底后高度还会变, 每步重读高度)。"""
     try:
         y = 0
-        for _ in range(60):
+        for _ in range(40):
             h = sb.execute_script("return document.body.scrollHeight") or 0
             if y >= h:
                 break
             sb.execute_script(f"window.scrollTo(0, {y})")
             y += 500
-            sb.sleep(1)
+            sb.sleep(0.5)
         sb.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-        sb.sleep(3)
-    except Exception as e:
-        log(f"滚动到底异常: {e}")
+        sb.sleep(2)
+    except Exception:
+        pass
 
 
 def _wait_text(sb, text, timeout=30):
-    """等页面出现某段文本, 返回是否出现。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -1926,47 +1156,52 @@ def _wait_text(sb, text, timeout=30):
     return False
 
 
+def _js_click_text_atomic(sb, text):
+    lit = json.dumps(text)
+    js = (
+        "var norm = function(s){ return (s || '').replace(/\\u00a0/g, ' ')"
+        "  .replace(/\\u2026|\\u2025/g, '...').replace(/\\s+/g, ' ').trim(); };"
+        "var target = " + lit + ";"
+        "function visible(el){ var r = el.getBoundingClientRect();"
+        "  return r.width > 0 && r.height > 0; }"
+        "var btns = document.querySelectorAll('button, a');"
+        "for (var i = 0; i < btns.length; i++) {"
+        "  if (norm(btns[i].innerText || btns[i].textContent) === target"
+        "      && visible(btns[i]) && !btns[i].disabled) {"
+        "    btns[i].click(); return 'clicked-button'; }"
+        "}"
+        "return 'not-found';"
+    )
+    try:
+        return sb.execute_script(js) or "not-found"
+    except Exception as e:
+        return f"异常: {e}"
+
+
+def pass_turnstile(sb, flow_handle, main_handle, tag, timeout=60):
+    if not focus_window(sb, flow_handle):
+        return False
+    try:
+        sb.uc_gui_click_captcha()
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sb.sleep(5)
+        close_extra_windows(sb, {flow_handle, main_handle})
+        focus_window(sb, flow_handle)
+        try:
+            if not sb.is_text_visible("Please check the captcha"):
+                return True
+        except Exception:
+            pass
+    return True
+
+
 def walk_shrinkme(sb, flow_handle, main_handle, tag):
-    """
-    走完一条 shrinkme 短链, 成功跳回 hokas.net 返回 True。
-    flow_handle: 点击 Add 后新开的 shrinkme 标签页(主标签页)。
-    真实流程(Deborah 2026-11-04 手动成功 16 步截图定稿):
-    1. 首页面(shrinkme.click/XXX): Turnstile 框 -> 勾选 -> 等约 30 秒变绿
-       “成功!” -> 点 "Click here to continue"。关键: 必须等绿再点;
-       点早了会跳任务页但步骤不算数(run 41790459629 的 6 轮就是这样,
-       但那次还有后退恢复旧状态的叠加原因, 见下)。
-    2. 点 Continue 后: 主标签页进 themezon STEP 页, 同时弹出任务/广告
-       标签页(如 Yahoo、hai8g.com)——弹窗只关不点(里面的“确认”框是
-       广告陷阱), 关完回到主标签页。主标签页跟随流程走, 绝不后退、
-       绝不用 driver.get 回首页面: 后退会恢复旧状态(验证页), 等于白点;
-       driver.get 回首页面会关窗口(两次复现)。
-    3. themezon STEP 1 OF 2: 点覆盖层 "CLICK TO VERIFY" -> 弹窗 -> 关掉。
-       页变 "To scroll down, click Continue..." + "Continue..." -> 滚到底
-       点 "Continue..." -> 底出现 "CONTINUE NEXT" -> 点 -> 弹窗 -> 关掉。
-       页变 STEP 2 OF 2。
-    4. themezon STEP 2 OF 2: "Scroll down to Generate Link, or click
-       Continue..." + "Continue..." -> 滚到底点 "Continue..." -> 底出现
-       "GENERATE LINK" -> 点 -> 弹窗 -> 关掉。页变 "CONTINUE TO YOUR
-       LINK" -> 点 -> 回到首页面(shrinkme.click)倒计时。
-    5. 首页面: "YOUR LINK IS ALMOST READY." + 10 秒倒计时("Please
-       wait...") -> 等倒计时走完 -> 点 "Get Link" -> 跳回 hokas.net。
-    按钮铁律: 只点覆盖层按钮, 且只按精确文本点 <button>
-    ("CLICK TO VERIFY" / "Continue..." / "CONTINUE NEXT" / "GENERATE
-    LINK" / "CONTINUE TO YOUR LINK" / "Get Link" / "Click here to
-    continue")。绝不点 <a> Continue(文章分页)、绝不点文章自己的
-    PREVIOUS/NEXT ARTICLE——旧版就是点中文章分页(#smg-next)才卡死的。
-    每步都有界: 等文本最多 30 秒, 点不上就截图停下, 不瞎转。
-    """
     focus_window(sb, flow_handle)
     sb.sleep(5)
     save_shot(sb, f"{tag}_shrinkme_open")
-    try:
-        first_url = sb.get_current_url() or ""
-    except Exception:
-        first_url = ""
-    log(f"[{tag}] shrinkme 页: {first_url}")
-    if not first_url:
-        return False
 
     def on_hokas():
         try:
@@ -1975,438 +1210,103 @@ def walk_shrinkme(sb, flow_handle, main_handle, tag):
             return False
 
     def settle_popups():
-        """关弹窗标签页、切回主标签页。"""
         close_extra_windows(sb, {flow_handle, main_handle})
         focus_window(sb, flow_handle)
 
-    # --- 阶段 1: 首页面验证码 ---
-    # 手动截图证明: 勾选后约 30 秒变绿“成功!”, 然后点 Continue。
-    # 因此这里不以“框消失”为通过标准(框变绿后仍在), 而是:
-    # 点框 -> 等绿(成功/Success)最多 90 秒 -> 绿了就点 Continue;
-    # 90 秒仍未绿, 也试一次 Continue(旧版有过第 2 轮过的先例),
-    # 但打明日志: 这次可能不算数。
     if not pass_turnstile(sb, flow_handle, main_handle, tag):
         return False
-    green = False
-    try:
-        green = sb.is_text_visible("成功") or sb.is_text_visible("Success")
-    except Exception:
-        pass
-    if not green:
-        log(f"[{tag}] 验证码框点后等绿(最多 90 秒)...")
-        deadline = time.time() + 90
-        while time.time() < deadline and not green:
-            sb.sleep(5)
-            settle_popups()
-            try:
-                green = sb.is_text_visible("成功") or sb.is_text_visible("Success")
-            except Exception:
-                pass
-        log(f"[{tag}] 验证码变绿: {green}")
-    if not green:
-        log(f"[{tag}] 验证码 90 秒仍未绿, 仍试一次 Continue(这次可能不算数)")
-    if not _click_overlay_button(sb, flow_handle, main_handle,
-                                 "Click here to continue", f"{tag}_step1_continue"):
-        log(f"[{tag}] 首页面 Continue 点不上")
-        return False
-    save_shot(sb, f"{tag}_after_step1")
-    if on_hokas():
-        return True
-    # 点完主标签页应进 themezon STEP 页(弹窗已在点完时关掉)
-    if not _wait_text(sb, "STEP 1 OF 2", timeout=30) and \
-            not _wait_text(sb, "CLICK TO VERIFY", timeout=10):
-        log(f"[{tag}] 点 Continue 后未进 STEP 1 页, 当前: {sb.get_current_url()}")
-        save_shot(sb, f"{tag}_no_step1")
-        return False
 
-    # --- 阶段 2: themezon STEP 1 OF 2 ---
-    if not _click_overlay_button(sb, flow_handle, main_handle,
-                                 "CLICK TO VERIFY", f"{tag}_step2_verify"):
-        log(f"[{tag}] CLICK TO VERIFY 点不上")
-        return False
-    save_shot(sb, f"{tag}_after_step2")
-    if on_hokas():
-        return True
-    # 应变 "To scroll down, click Continue..." + Continue...
-    if not _wait_text(sb, "click Continue", timeout=30):
-        log(f"[{tag}] CLICK TO VERIFY 后未出现滚到底提示")
-        save_shot(sb, f"{tag}_no_scroll_hint1")
-        return False
-    _scroll_to_bottom(sb)
-    # 滚到底后覆盖层状态可能已翻转: 实测(run 41810242412)滚到底后页面
-    # BUTTON 只有 CONTINUE NEXT, 没有 Continue...——滚到底这个动作本身
-    # 就把覆盖层推到了底部状态。因此 Continue... 点不上时, 直接试
-    # CONTINUE NEXT(它就是同一步的下一个按钮), 点上就跳过下面那次
-    # 重复的滚到底+CONTINUE NEXT, 直接去等 STEP 2。
-    _continue_next_done = False
-    if not _click_overlay_button(sb, flow_handle, main_handle,
-                                 "Continue...", f"{tag}_step2_continue"):
-        log(f"[{tag}] STEP 1 的 Continue... 不在, 试 CONTINUE NEXT(滚到底后覆盖层可能已变)")
-        if _click_overlay_button(sb, flow_handle, main_handle,
-                                 "CONTINUE NEXT", f"{tag}_step2_continue_next_early"):
-            _continue_next_done = True
-        else:
-            log(f"[{tag}] STEP 1 的 Continue.../CONTINUE NEXT 都点不上")
-            return False
-    if on_hokas():
-        return True
-    if not _continue_next_done:
-        # 滚到底后底出现 CONTINUE NEXT(点 Continue... 后页面到底部, URL 带 #smg-next)
-        _scroll_to_bottom(sb)
-        if not _click_overlay_button(sb, flow_handle, main_handle,
-                                     "CONTINUE NEXT", f"{tag}_step2_continue_next"):
-            log(f"[{tag}] CONTINUE NEXT 点不上")
-            return False
-    if on_hokas():
-        return True
-    # 应进 STEP 2 OF 2
-    if not _wait_text(sb, "STEP 2 OF 2", timeout=30):
-        log(f"[{tag}] CONTINUE NEXT 后未进 STEP 2 页")
-        save_shot(sb, f"{tag}_no_step2")
-        return False
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if sb.is_text_visible("成功") or sb.is_text_visible("Success"):
+            break
+        sb.sleep(3)
+        settle_popups()
 
-    # --- 阶段 3: themezon STEP 2 OF 2 ---
-    if not _wait_text(sb, "click Continue", timeout=30):
-        log(f"[{tag}] STEP 2 未出现滚到底提示")
-        save_shot(sb, f"{tag}_no_scroll_hint2")
-        return False
+    _click_overlay_button(sb, flow_handle, main_handle, "Click here to continue", f"{tag}_step1_continue")
+    if on_hokas():
+        return True
+
+    _wait_text(sb, "STEP 1 OF 2", timeout=25)
+    _click_overlay_button(sb, flow_handle, main_handle, "CLICK TO VERIFY", f"{tag}_step2_verify")
+    if on_hokas():
+        return True
+
+    _wait_text(sb, "click Continue", timeout=25)
     _scroll_to_bottom(sb)
-    # 与 STEP 1 同理: 滚到底后覆盖层可能已直接是 GENERATE LINK, Continue...
-    # 不在时直接试它, 点上就跳过下面那次重复的滚到底+GENERATE LINK。
-    _generate_done = False
-    if not _click_overlay_button(sb, flow_handle, main_handle,
-                                 "Continue...", f"{tag}_step3_continue"):
-        log(f"[{tag}] STEP 2 的 Continue... 不在, 试 GENERATE LINK(滚到底后覆盖层可能已变)")
-        if _click_overlay_button(sb, flow_handle, main_handle,
-                                 "GENERATE LINK", f"{tag}_step3_generate_early"):
-            _generate_done = True
-        else:
-            log(f"[{tag}] STEP 2 的 Continue.../GENERATE LINK 都点不上")
-            return False
+    if not _click_overlay_button(sb, flow_handle, main_handle, "Continue...", f"{tag}_step2_continue"):
+        _click_overlay_button(sb, flow_handle, main_handle, "CONTINUE NEXT", f"{tag}_step2_continue_next")
     if on_hokas():
         return True
-    if not _generate_done:
-        _scroll_to_bottom(sb)
-        if not _click_overlay_button(sb, flow_handle, main_handle,
-                                     "GENERATE LINK", f"{tag}_step3_generate"):
-            log(f"[{tag}] GENERATE LINK 点不上")
-            return False
+
+    _wait_text(sb, "STEP 2 OF 2", timeout=25)
+    _scroll_to_bottom(sb)
+    if not _click_overlay_button(sb, flow_handle, main_handle, "Continue...", f"{tag}_step3_continue"):
+        _click_overlay_button(sb, flow_handle, main_handle, "GENERATE LINK", f"{tag}_step3_generate")
     if on_hokas():
         return True
-    # 应变 CONTINUE TO YOUR LINK
-    if not _wait_text(sb, "CONTINUE TO YOUR LINK", timeout=30):
-        log(f"[{tag}] GENERATE LINK 后未出现 CONTINUE TO YOUR LINK")
-        save_shot(sb, f"{tag}_no_continue_to_link")
-        return False
-    if not _click_overlay_button(sb, flow_handle, main_handle,
-                                 "CONTINUE TO YOUR LINK", f"{tag}_step3_to_link"):
-        log(f"[{tag}] CONTINUE TO YOUR LINK 点不上")
-        return False
+
+    _wait_text(sb, "CONTINUE TO YOUR LINK", timeout=25)
+    _click_overlay_button(sb, flow_handle, main_handle, "CONTINUE TO YOUR LINK", f"{tag}_step3_to_link")
     if on_hokas():
         return True
-    # 应回首页面倒计时
+
     settle_popups()
-    if not _wait_text(sb, "YOUR LINK IS ALMOST READY", timeout=30):
-        log(f"[{tag}] CONTINUE TO YOUR LINK 后未回首页面倒计时, 当前: {sb.get_current_url()}")
-        save_shot(sb, f"{tag}_no_countdown")
-        return False
+    _wait_text(sb, "YOUR LINK IS ALMOST READY", timeout=30)
 
-    # --- 阶段 4: 首页面倒计时 -> Get Link ---
-    # 教训(run 41811223572): 倒计时页截图明明显示 0 秒+绿色 Get Link,
-    # 旧逻辑(只认 <button> + Selenium is_visible/is_clickable)却 90 秒
-    # 都没见它可点。原因同 Start/Add-12 一家: Selenium 的可见/可用
-    # 判定在这类页上会漏掉明明存在的元素(且 Get Link 也可能根本不是
-    # <button> 而是 <a>)。改成原子 JS 轮询: 一次调用内找+点(不跨
-    # 边界传元素, 免 stale), 点上后扫一遍窗口看是否跳回 hokas, 90 秒
-    # 内没跳回才失败。
-    _getlink_deadline = time.time() + 90
-    _getlink_clicked = False
-    while time.time() < _getlink_deadline:
+    _gl_deadline = time.time() + 90
+    while time.time() < _gl_deadline:
         settle_popups()
         if on_hokas():
             return True
         focus_window(sb, flow_handle)
-        try:
-            _gl = _js_click_text_atomic(sb, "Get Link")
-        except Exception as e:
-            _gl = f"异常: {e}"
-        log(f"[{tag}] Get Link 原子点: {_gl}")
+        _gl = _js_click_text_atomic(sb, "Get Link")
         if isinstance(_gl, str) and _gl.startswith("clicked"):
-            _getlink_clicked = True
             sb.sleep(5)
             for h in list(sb.driver.window_handles):
                 try:
                     sb.driver.switch_to.window(h)
                     if "hokas.net" in sb.get_current_url():
-                        log(f"[{tag}] Get Link 成功, 已回到 hokas.net: {sb.get_current_url()}")
-                        save_shot(sb, f"{tag}_back_on_hokas")
                         return True
                 except Exception:
                     continue
-            close_extra_windows(sb, {flow_handle, main_handle})
-            focus_window(sb, flow_handle)
-            try:
-                if "hokas.net" in sb.get_current_url():
-                    return True
-            except Exception:
-                pass
         sb.sleep(5)
-    log(f"[{tag}] Get Link 90 秒仍未跳回 hokas.net(点上过: {_getlink_clicked})")
-    save_shot(sb, f"{tag}_getlink_failed")
     return False
 
 
-def _js_find_by_text(sb, text):
-    """用 JS 按渲染文本找元素, 返回 WebElement 或 None。
-    穿透 shadow DOM, 容忍空白符差异(innerText 归一化)。
-    execute_script 可以直接返回 DOM 元素, 调用方用 WebDriver 原生点击
-    (可信点击, 比 JS el.click() 更不容易被页面忽略)。
-    CLICK TO VERIFY 就是靠这招才找到的, Add 按钮同理兜底。"""
-    lit = json.dumps(text)
-    lit_up = json.dumps(text.upper())
-    js = (
-        "var out = [], outCi = [];"
-        "function walk(root) {"
-        "  var els = root.querySelectorAll('*');"
-        "  for (var i = 0; i < els.length; i++) {"
-        "    var el = els[i];"
-        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
-        "    var t = (el.innerText || el.textContent || '').trim();"
-        "    if (t === " + lit + ") { out.push(el); }"
-        "    else if (t.toUpperCase() === " + lit_up + ") { outCi.push(el); }"
-        "  }"
-        "}"
-        "var docs = [document];"
-        "var frs = document.querySelectorAll('iframe');"
-        "for (var k = 0; k < frs.length; k++) {"
-        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
-        "  catch (e) {}"
-        "}"
-        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
-        "var cands = out.length > 0 ? out : outCi;"
-        "if (cands.length === 0) { return null; }"
-        "for (var j = 0; j < cands.length; j++) {"
-        "  if (['BUTTON', 'A', 'INPUT'].indexOf(cands[j].tagName) >= 0) {"
-        "    return cands[j];"
-        "  }"
-        "}"
-        "return cands[cands.length - 1];"
-    )
-    try:
-        return sb.execute_script(js)
-    except Exception:
-        return None
-
-
-def _js_find_by_contains(sb, *needles):
-    """用 JS 按子串找元素(渲染文本同时包含所有 needles), 返回 WebElement 或 None。
-    精确文本匹配会被图标字符/多余空白破坏, 子串匹配不受影响; 不分标签。"""
-    conds = " && ".join(
-        f"(t.indexOf({json.dumps(n)}) >= 0)" for n in needles)
-    js = (
-        "var out = [];"
-        "function walk(root) {"
-        "  var els = root.querySelectorAll('*');"
-        "  for (var i = 0; i < els.length; i++) {"
-        "    var el = els[i];"
-        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
-        "    var t = (el.innerText || el.textContent || '').trim();"
-        "    if (" + conds + ") { out.push(el); }"
-        "  }"
-        "}"
-        "var docs = [document];"
-        "var frs = document.querySelectorAll('iframe');"
-        "for (var k = 0; k < frs.length; k++) {"
-        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
-        "  catch (e) {}"
-        "}"
-        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
-        "if (out.length === 0) { return null; }"
-        "for (var j = 0; j < out.length; j++) {"
-        "  if (['BUTTON', 'A', 'INPUT'].indexOf(out[j].tagName) >= 0) {"
-        "    return out[j];"
-        "  }"
-        "}"
-        "return out[out.length - 1];"
-    )
-    try:
-        return sb.execute_script(js)
-    except Exception:
-        return None
-
-
-def _js_find_visible_by_text(sb, text):
-    """用 JS 按精确渲染文本找元素, 且要求它在屏幕上有尺寸, 返回 WebElement 或 None。
-    绕过 Selenium is_displayed 在这类面板上的误判: 元素明明渲染在屏
-    幕上, is_displayed 却可能因祖先样式返回 False, 而 getBoundingClientRect
-    量出的尺寸是实的。写法与 _js_find_by_text 相同(顶层裸 return)。
-    调用方仍用 WebDriver 原生点击, 且 is_clickable 只查 enabled/属性, 不查 displayed。"""
-    lit = json.dumps(text)
-    lit_up = json.dumps(text.upper())
-    js = (
-        "var out = [], outCi = [];"
-        "function walk(root) {"
-        "  var els = root.querySelectorAll('*');"
-        "  for (var i = 0; i < els.length; i++) {"
-        "    var el = els[i];"
-        "    if (el.shadowRoot) { walk(el.shadowRoot); }"
-        "    var t = (el.innerText || el.textContent || '').trim();"
-        "    var r = null;"
-        "    try { r = el.getBoundingClientRect(); } catch (e) { continue; }"
-        "    if (!r || r.width <= 0 || r.height <= 0) { continue; }"
-        "    if (t === " + lit + ") { out.push(el); }"
-        "    else if (t.toUpperCase() === " + lit_up + ") { outCi.push(el); }"
-        "  }"
-        "}"
-        "var docs = [document];"
-        "var frs = document.querySelectorAll('iframe');"
-        "for (var k = 0; k < frs.length; k++) {"
-        "  try { if (frs[k].contentDocument) { docs.push(frs[k].contentDocument); } }"
-        "  catch (e) {}"
-        "}"
-        "for (var d = 0; d < docs.length; d++) { walk(docs[d]); }"
-        "var cands = out.length > 0 ? out : outCi;"
-        "if (cands.length === 0) { return null; }"
-        "for (var j = 0; j < cands.length; j++) {"
-        "  if (['BUTTON', 'A', 'INPUT'].indexOf(cands[j].tagName) >= 0) {"
-        "    return cands[j];"
-        "  }"
-        "}"
-        "return cands[cands.length - 1];"
-    )
-    try:
-        return sb.execute_script(js)
-    except Exception:
-        return None
-
-
 def find_add_button(sb, hours):
-    """在 Overview 页找 Add XX Hours 按钮, 返回 (xpath, 元素或None)。
-    放宽两点(run 41754237293 里 Add 12 明明可见却没找到):
-    1) 按钮可能不是 <button>/<a>(如 div 模拟按钮), 兜底按精确文本
-       "Add XX Hours" 找任意元素;
-    2) 面板可能渲染稍慢, 轮询 3 次再放弃。"""
-    xpaths = [
-        (f'//button[contains(., "Add") and contains(., "{hours}")] | '
-         f'//a[contains(., "Add") and contains(., "{hours}")]'),
-        f'//*[normalize-space()="Add {hours} Hours"]',
-    ]
+    xpath = f'//button[contains(., "Add") and contains(., "{hours}")] | //a[contains(., "Add") and contains(., "{hours}")]'
     for _ in range(3):
-        for xpath in xpaths:
-            try:
-                els = []
-                for e in sb.find_elements(xpath, by="xpath"):
-                    try:
-                        if e.is_displayed():
-                            els.append(e)
-                    except Exception:
-                        # 单个元素过期(如倒计时每秒重绘面板)不能带走整批结果
-                        continue
-                if els:
-                    return xpath, els[0]
-            except Exception:
-                continue
-        sb.sleep(3)
-    # XPath 全军覆没时用 JS 渲染文本找: 面板按钮也可能有空白符/Shadow 问题,
-    # Add 12 在多个运行里明明可见却找不到, 不能再带着这个已知问题跑。
-    try:
-        el = _js_find_by_text(sb, f"Add {hours} Hours")
-        if el is not None:
-            try:
-                if el.is_displayed():
-                    log(f"[Add {hours} Hours] JS 兜底找到按钮")
-                    return "JS", el
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # 精确文本也找不到时, 按子串找(图标字符/多余空白会破坏精确匹配,
-    # 但 "Add"+"12" 子串一定在): 不分标签, 优先 button/a/input。
-    try:
-        el = _js_find_by_contains(sb, "Add", str(hours))
-        if el is not None:
-            try:
-                if el.is_displayed():
-                    log(f"[Add {hours} Hours] JS 子串兜底找到按钮")
-                    return "JS", el
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # 精确/子串文本都找到了元素、却因 is_displayed 误判被丢掉时,
-    # 改按 JS 量尺寸判断(在屏幕上有尺寸即视为可见): run 41774629178
-    # 的 DOM 证据证明 <BUTTON>Add 12 Hours</BUTTON> 就在主文档里,
-    # 找不到的原因只剩可见性判断这一环。
-    try:
-        el = _js_find_visible_by_text(sb, f"Add {hours} Hours")
-        if el is not None:
-            log(f"[Add {hours} Hours] JS 尺寸兜底找到按钮")
-            return "JS", el
-    except Exception:
-        pass
-    # 全部找不到时留一份 DOM 证据, 下次不再靠猜。
-    # 注意: 必须包成 IIFE, 裸 return 在某些执行路径下会报 Illegal return statement
-    # (run 41769447156 的 DOM 证据就是这么采集失败的)。
-    try:
-        dump = sb.execute_script(
-            "(function(){"
-            "var out = [];"
-            "var els = document.querySelectorAll('*');"
-            "for (var i = 0; i < els.length; i++) {"
-            "  var t = (els[i].innerText || els[i].textContent || '').trim();"
-            "  if (t.indexOf('Add') >= 0 && t.length < 60) {"
-            "    out.push(els[i].tagName + '|' + t);"
-            "  }"
-            "}"
-            "return out.slice(0, 20).join('; ');"
-            "})()")
-        log(f"[Add {hours} Hours] DOM 证据(文本含 Add 的元素): {dump}")
-    except Exception as e:
-        log(f"[Add {hours} Hours] DOM 证据采集失败: {e}")
-    return xpaths[0], None
+        try:
+            els = [e for e in sb.find_elements(xpath, by="xpath") if e.is_displayed()]
+            if els:
+                return xpath, els[0]
+        except Exception:
+            pass
+        sb.sleep(2)
+    return xpath, None
 
 
 def run_add_flow(sb, main_handle, hours, before_minutes):
-    """
-    处理一个 Add 按钮: 点击 -> 走 shrinkme -> 回 Overview 复查。
-    返回 "credited" / "walk_failed" / "not_credited" / "unavailable"
-    """
     tag = f"add{hours}h"
-    # 冷却跳过(必须在找按钮之前): 面板会写 "12h option used - try again
-    # after 22:39 (24h still available)"。教训(run 41804154827): 原先
-    # 先找按钮、后查冷却, Add 12 的查找 miss(可见性怪问题)还没走到
-    # 冷却检查就返回了“未找到按钮”, 冷却跳过成了死代码。面板文字是
-    # 可靠的(截图里明明白白写着), 所以先查文字, 冷却中直接跳过,
-    # 根本不需要找按钮。已冷却的按钮不要走(走了也不到账, 白白耗一次
-    # shrinkme 流程)。
     try:
         if sb.is_text_visible(f"{hours}h option used"):
-            log(f"[Add {hours} Hours] 面板显示该选项已用(冷却中), 跳过不走")
+            log(f"[Add {hours} Hours] 面板显示已冷却，跳过")
             return "unavailable"
     except Exception:
         pass
-    xpath, el = find_add_button(sb, hours)
+
+    _, el = find_add_button(sb, hours)
     if el is None:
-        log(f"[Add {hours} Hours] 未找到按钮(可能面板结构变化或未到可用时间)")
-        save_shot(sb, f"{tag}_no_button")
         return "unavailable"
-    btn_text = (el.text or "").strip()
-    if not is_clickable(el):
-        log(f"[Add {hours} Hours] 按钮[{btn_text}]不可点击(6 小时冷却中)")
-        return "unavailable"
+
     try:
         sb.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         sb.sleep(1)
         el.click()
-        try:
-            cur_u = sb.get_current_url() or ""
-        except Exception:
-            cur_u = ""
-        log(f"[Add {hours} Hours] 已点击按钮[{btn_text}] (点击时 URL: {cur_u}), 等待 shrinkme 新标签页...")
-    except Exception as e:
-        log(f"[Add {hours} Hours] 点击失败: {e}")
+    except Exception:
         return "walk_failed"
-    # 等待新窗口(shrinkme)出现
+
     flow_handle = None
     deadline = time.time() + 30
     while time.time() < deadline:
@@ -2421,419 +1321,135 @@ def run_add_flow(sb, main_handle, hours, before_minutes):
                             flow_handle = h
                             break
                     except Exception:
-                        continue
+                        pass
             if flow_handle:
                 break
-        else:
-            # 也可能同标签跳转
-            try:
-                if "shrinkme" in sb.get_current_url():
-                    flow_handle = sb.driver.current_window_handle
-                    break
-            except Exception:
-                pass
+
     if not flow_handle:
-        log(f"[Add {hours} Hours] 未等到 shrinkme 标签页")
-        save_shot(sb, f"{tag}_no_shrinkme_tab")
-        focus_window(sb, main_handle)
         return "walk_failed"
 
     walked = walk_shrinkme(sb, flow_handle, main_handle, tag)
-
-    # 回到主窗口并刷新 Overview 复查
     close_extra_windows(sb, {main_handle})
-    if not focus_window(sb, main_handle):
-        # 主窗口被关掉的兜底: 用剩下的任意 hokas 窗口
-        for h in sb.driver.window_handles:
-            try:
-                sb.driver.switch_to.window(h)
-                if "hokas.net" in sb.get_current_url():
-                    main_handle = h
-                    break
-            except Exception:
-                continue
+    focus_window(sb, main_handle)
     try:
-        sb.open(sb.get_current_url())
+        sb.open(PANEL_URL)
+        sb.sleep(3)
+        open_server_overview(sb)
     except Exception:
         pass
-    sb.sleep(5)
-    # 若刷新后不在 Overview, 重新进一次。复查时当前窗可能已不是面板
-    # (如停在广告页), 先回面板首页再进 Overview, 否则导航点击必然失败。
+
     after_minutes, after_raw = get_remaining(sb)
     if after_minutes is None:
-        try:
-            try:
-                sb.open(PANEL_URL)
-                sb.sleep(3)
-            except Exception:
-                pass
-            open_server_overview(sb)
-            after_minutes, after_raw = get_remaining(sb)
-        except Exception as e:
-            log(f"复查时重进 Overview 失败: {e}")
-    save_shot(sb, f"{tag}_after_check")
-    if after_minutes is None:
-        log(f"[Add {hours} Hours] 复查未能读到剩余时间(walked={walked})")
-        return "walk_failed" if not walked else "not_credited"
-    log(f"[Add {hours} Hours] 剩余时间: {before_minutes} 分钟 -> {after_minutes} 分钟"
-        f" ({after_raw})")
+        return "not_credited" if walked else "walk_failed"
+
     gained = after_minutes - before_minutes
-    # 到账判据: 增量达到标称时长的 80%(扣掉流程耗时与读数取整误差)
     if gained >= hours * 60 * 0.8:
-        log(f"[Add {hours} Hours] ✅ 已到账, 增加约 {gained} 分钟")
+        log(f"[Add {hours} Hours] 到账增加约 {gained} 分钟")
         return "credited"
-    log(f"[Add {hours} Hours] 未确认到账(增量 {gained} 分钟, walked={walked})")
     return "not_credited" if walked else "walk_failed"
 
 
-# ---------------- 主流程 ----------------
-def _js_find_start_button(sb):
-    """用 JS 在当前 DOM 里新鲜查找 Start 按钮(抗 stale)。
-    教训(run 41804154827): Overview 右上角明明有白色“▶ Start”按钮,
-    但 XPath 精确文本 "Start" 对不上“▶ Start”, 含 Start 的兜底也没捞到
-    (可能元素不是 <button>, 或取到时已被每秒重渲染 stale 掉)。
-    因此用 JS 现查: 只扫 button/a/[role=button], 文本含 Start 且不含
-    Restart, 矩形可见且未禁用, 返回第一个; 找不到返回 None。
-    JS 现查没有 stale 问题(每次都是 fresh DOM 查询)。
-    兜底(run 41807429359 教训): button/a/[role=button] 扫不到时, 再扫
-    全部元素取叶节点(文本含 Start、不含 Restart、矩形可见、无含 Start
-    的后代元素), 文本最短者优先(按钮文本 "▶ Start" 短, 祖先容器文本
-    长, 不会被误取; 长度相同取文档顺序第一个)。"""
-    js = """
-    var els = document.querySelectorAll('button, a, [role="button"]');
-    for (var i = 0; i < els.length; i++) {
-      var t = (els[i].innerText || els[i].textContent || '').trim();
-      if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1) {
-        var r = els[i].getBoundingClientRect();
-        if (r.width > 0 && r.height > 0 && !els[i].disabled) return els[i];
-      }
-    }
-    var all = document.querySelectorAll('*');
-    var matches = [];
-    for (var j = 0; j < all.length; j++) {
-      var el = all[j];
-      var t2 = (el.innerText || el.textContent || '').trim();
-      if (t2.indexOf('Start') !== -1 && t2.indexOf('Restart') === -1) {
-        var r2 = el.getBoundingClientRect();
-        if (r2.width > 0 && r2.height > 0) matches.push(el);
-      }
-    }
-    var leaf = matches.filter(function(el) {
-      return !matches.some(function(m) { return m !== el && el.contains(m); });
-    });
-    var best = null, bestLen = 1e9;
-    for (var k = 0; k < leaf.length; k++) {
-      var lt = (leaf[k].innerText || leaf[k].textContent || '').trim().length;
-      if (lt < bestLen) { bestLen = lt; best = leaf[k]; }
-    }
-    return best;
-    """
-    try:
-        return sb.execute_script(js)
-    except Exception:
-        return None
-
-
-def _js_dump_start_candidates(sb):
-    """失败诊断: 列出页面上文本含 Start 的元素(标签+文本+是否禁用+
-    矩形+class, 最多 15 个)。教训(run 41810242412): dump 只说
-    BUTTON|Start 存在, 却没说它是不是禁用/不可见——而查找器恰恰
-    只认可用可见的按钮, 所以下次必须把禁用和矩形也打出来, 才能
-    定性是“禁用中”还是“查找器漏网”。"""
-    js = """
-    var all = document.querySelectorAll('*');
-    var out = [];
-    for (var i = 0; i < all.length && out.length < 15; i++) {
-      var t = (all[i].innerText || all[i].textContent || '').replace(/\\s+/g, ' ').trim();
-      if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1 && t.length < 80) {
-        var r = all[i].getBoundingClientRect();
-        out.push(all[i].tagName + '|' + t + '|disabled=' + (!!all[i].disabled)
-          + '|rect=' + Math.round(r.width) + 'x' + Math.round(r.height)
-          + '|class=' + (all[i].className || '').toString().slice(0, 40));
-      }
-    }
-    return out.join('; ');
-    """
-    try:
-        return sb.execute_script(js) or ""
-    except Exception:
-        return ""
-
-
-def _js_click_text_atomic(sb, text):
-    """原子 JS 找+点(精确文本): 一次 JS 调用内按归一化精确文本找到
-    可见可用的控件并立即点它, 返回状态字符串(不跨 Python/JS 边界
-    传元素, 免去页面重渲染造成的 stale)。<button> 优先, 再任意叶
-    元素(含 <a>; 调用方保证精确文本在本页无歧义, 如 Get Link 页)。
-    用于 Get Link(旧逻辑只认 <button> + Selenium 可见判定, 实测
-    截图明明有绿色 Get Link 却 90 秒没见它可点)。"""
-    lit = json.dumps(text)
-    js = (
-        "var norm = function(s){ return (s || '').replace(/\\u00a0/g, ' ')"
-        "  .replace(/\\u2026|\\u2025/g, '...').replace(/\\s+/g, ' ').trim(); };"
-        "var target = " + lit + ";"
-        "function visible(el){ var r = el.getBoundingClientRect();"
-        "  return r.width > 0 && r.height > 0; }"
-        "var btns = document.querySelectorAll('button');"
-        "for (var i = 0; i < btns.length; i++) {"
-        "  if (norm(btns[i].innerText || btns[i].textContent) === target"
-        "      && visible(btns[i]) && !btns[i].disabled) {"
-        "    btns[i].click(); return 'clicked-button'; }"
-        "}"
-        "var all = document.querySelectorAll('*');"
-        "var best = null, bestLen = 1e9;"
-        "for (var j = 0; j < all.length; j++) {"
-        "  var el = all[j];"
-        "  var t = norm(el.innerText || el.textContent);"
-        "  if (t !== target) { continue; }"
-        "  if (!visible(el) || el.disabled) { continue; }"
-        "  var has = false;"
-        "  for (var k = 0; k < el.children.length; k++) {"
-        "    if (norm(el.children[k].innerText || el.children[k].textContent) === target) { has = true; break; }"
-        "  }"
-        "  if (has) { continue; }"
-        "  if (t.length < bestLen) { best = el; bestLen = t.length; }"
-        "}"
-        "if (best) { best.click(); return 'clicked-leaf'; }"
-        "return 'not-found';"
-    )
-    try:
-        return sb.execute_script(js) or "not-found"
-    except Exception as e:
-        return f"异常: {e}"
-
-
-def _js_click_start_atomic(sb):
-    """原子 JS 找+点 Start: 一次 JS 调用内找到可见可用的 Start 并立即
-    点它, 返回 'clicked|<text>' 或 'not-found'(字符串, 免 stale)。
-    教训(run 41811223572): dump 明明证明 BUTTON|Start 存在且
-    disabled=false、矩形 93x42, 但先找元素再跨边界点的老路 60 秒
-    都没捞到——页面每秒重渲染, 跨边界传的元素到手就 stale。
-    找法: <button>/<a>/[role=button] 中文本含 Start(不含 Restart)、
-    可见、未禁用者优先; 再任意叶元素(文本含 Start、不含 Restart、
-    可见、未禁用、最短文本优先)。"""
-    js = (
-        "function norm(s){ return (s || '').replace(/\\u00a0/g, ' ')"
-        "  .replace(/\\s+/g, ' ').trim(); }"
-        "function visible(el){ var r = el.getBoundingClientRect();"
-        "  return r.width > 0 && r.height > 0; }"
-        "var els = document.querySelectorAll('button, a, [role=\"button\"]');"
-        "for (var i = 0; i < els.length; i++) {"
-        "  var t = norm(els[i].innerText || els[i].textContent);"
-        "  if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1"
-        "      && visible(els[i]) && !els[i].disabled) {"
-        "    els[i].click(); return 'clicked|' + t; }"
-        "}"
-        "var all = document.querySelectorAll('*');"
-        "var best = null, bestLen = 1e9, bestText = '';"
-        "for (var j = 0; j < all.length; j++) {"
-        "  var el = all[j];"
-        "  var tt = norm(el.innerText || el.textContent);"
-        "  if (tt.indexOf('Start') === -1 || tt.indexOf('Restart') !== -1) { continue; }"
-        "  if (!visible(el) || el.disabled) { continue; }"
-        "  var has = false;"
-        "  for (var k = 0; k < el.children.length; k++) {"
-        "    var ct = norm(el.children[k].innerText || el.children[k].textContent);"
-        "    if (ct.indexOf('Start') !== -1 && ct.indexOf('Restart') === -1) { has = true; break; }"
-        "  }"
-        "  if (has) { continue; }"
-        "  if (tt.length < bestLen) { best = el; bestLen = tt.length; bestText = tt; }"
-        "}"
-        "if (best) { best.click(); return 'clicked|' + bestText; }"
-        "return 'not-found';"
-    )
-    try:
-        return sb.execute_script(js) or "not-found"
-    except Exception as e:
-        return f"异常: {e}"
-
-
 def ensure_started(sb):
-    """过期服务器加时长后仍是 Stopped, 必须点 Start 才能真正上线。
-    (Deborah 2026-11-04 指出: 页面有 Start 按钮, 加完时长直接启动。
-    之前脚本只核对剩余时间, 从没处理过 Start——这是个缺口。)
-    仅当剩余时间 > 0 时尝试; 运行中的服务器不动。
-    返回 "started" / "already_running" / "no_time" / "start_failed" / "no_button"。"""
     try:
         remaining, _ = get_remaining(sb)
+        if remaining is not None and remaining <= 0:
+            return "no_time"
     except Exception:
-        remaining = None
-    if remaining is not None and remaining <= 0:
-        log("[Start] 剩余时间为 0, 无时长可启动, 跳过 Start")
-        return "no_time"
-    # 点 Start: 原子 JS 找+点(一次 JS 调用内找并立即点, 不跨边界传
-    # 元素)。教训(run 41811223572): 页面每秒重渲染, 老路先找元素再
-    # 点, 60 秒都没捞到明明存在且可用的 BUTTON|Start。最多轮询 60 秒,
-    # 点上立刻进 Running 等待; 60 秒都没点上才走 no_button 诊断。
-    _start_clicked_text = None
-    _start_deadline = time.time() + 60
-    while time.time() < _start_deadline and _start_clicked_text is None:
+        pass
+
+    js = """
+    var btns = document.querySelectorAll('button, a');
+    for (var i = 0; i < btns.length; i++) {
+        var t = (btns[i].innerText || '').trim();
+        if (t.indexOf('Start') !== -1 && t.indexOf('Restart') === -1 && !btns[i].disabled) {
+            btns[i].click();
+            return 'clicked';
+        }
+    }
+    return 'not-found';
+    """
+    for _ in range(20):
         try:
-            _st = _js_click_start_atomic(sb)
-        except Exception as e:
-            _st = f"异常: {e}"
-        if isinstance(_st, str) and _st.startswith("clicked"):
-            _start_clicked_text = _st.split("|", 1)[1] if "|" in _st else ""
-            break
-        sb.sleep(2)
-    if _start_clicked_text is None:
-        # 没有可点的 Start 按钮: 可能已在运行(Start 被禁用/消失)
-        try:
-            if sb.is_text_visible("Running") or sb.is_text_visible("RUNNING"):
-                log("[Start] 已在运行, 无需启动")
-                return "already_running"
-        except Exception:
-            pass
-        try:
-            log(f"[Start] 未找到可点的 Start 按钮, 含 Start 的元素: "
-                f"{_js_dump_start_candidates(sb)}")
-        except Exception:
-            log("[Start] 未找到可点的 Start 按钮")
-        return "no_button"
-    try:
-        cur_u = sb.get_current_url() or ""
-    except Exception:
-        cur_u = ""
-    log(f"[Start] 已点击 Start 按钮[{_start_clicked_text}] (点击时 URL: {cur_u}), 等待启动...")
-    # 启动需要时间: 最多等 60 秒, 看到 Running 即成功
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        sb.sleep(5)
-        try:
-            if sb.is_text_visible("Running") or sb.is_text_visible("RUNNING"):
-                log("[Start] 服务器已进入 Running, 启动成功")
+            if sb.execute_script(js) == 'clicked':
                 return "started"
         except Exception:
             pass
-    # 超时后最后确认一次: Stopped 是否消失
-    try:
-        if not sb.is_text_visible("Stopped"):
-            log("[Start] 等待超时但 Stopped 已消失, 视为已启动")
-            return "started"
-    except Exception:
-        pass
-    log("[Start] 等待 60 秒仍未确认 Running, 启动结果未知")
-    return "start_failed"
+        sb.sleep(2)
+    return "no_button"
 
 
+# ---------------- 主入口 ----------------
 def main():
     if not EMAIL:
         log("错误: 必须配置 EMAIL 环境变量")
         sys.exit(1)
     if not EMAIL_PASSWORD and not GMAIL_PASSWORD:
-        log("错误: 必须配置 EMAIL_PASSWORD(IMAP 授权码) 或 GMAIL_PASSWORD(网页密码)")
+        log("错误: 必须配置 EMAIL_PASSWORD 或 GMAIL_PASSWORD")
         sys.exit(1)
 
     result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL}"]
     credited_any = False
-    # 阶段变量: 只有阶段真正开始时才推进, 失败信息按它来报, 绝不能让
-    # 启动阶段的失败打印成登录失败、让登录失败打印成续期失败。
-    stage = "startup"
-    # 浏览器会话: 配置了家宽代理就全程走代理(登录和 shrinkme 都用家宽 IP,
-    # 更像真人); 未配置则直连。seleniumbase 的 proxy 参数支持带账号密码
-    # 的代理, 认证由它内部处理。
-    sb_kwargs = dict(uc=True, test=True, locale_code="en",
-                     headless=False, xvfb=True)
-    log(f"浏览器代理: {proxy_label()}")
-    # 代理处理(2026-11-04 run 41748751838 教训): vless/hysteria2 节点浏览器
-    # 不能直接用, 在此经 Xray 转成本地代理; vmess/trojan/ss 等暂不支持,
-    # 明说后退出, 不启动浏览器、不消耗任何登录尝试。
+
+    sb_kwargs = dict(uc=True, test=True, locale_code="en", headless=False, xvfb=True)
+    log(f"浏览器代理状态: {proxy_label()}")
+
+    # 代理转发逻辑：sing-box 优先或备用 Xray
     if PROXY:
-        _scheme = PROXY.split("://", 1)[0].lower() if "://" in PROXY else ""
-        if _scheme == "vless":
-            sb_kwargs["proxy"] = start_vless_proxy(PROXY)
-        elif _scheme in ("hysteria2", "hy2"):
-            sb_kwargs["proxy"] = start_hysteria2_proxy(PROXY)
-        elif _scheme in ("vmess", "trojan", "ss", "ssr"):
-            log(f"PROXY 格式错误: 当前值是 {_scheme} 协议节点, 暂不支持转换; "
-                "请换成 http/socks5 节点、vless 节点或 hysteria2 节点, 本次不启动浏览器")
-            sys.exit(1)
-        else:
+        scheme = PROXY.split("://", 1)[0].lower() if "://" in PROXY else ""
+        if scheme in ("vless", "hysteria2", "hy2", "trojan", "ss"):
+            if PROXY_CORE == "sing-box":
+                sb_kwargs["proxy"] = start_singbox_proxy(PROXY)
+            else:
+                sb_kwargs["proxy"] = start_xray_proxy(PROXY)
+        elif scheme in ("http", "socks5"):
             sb_kwargs["proxy"] = PROXY
+        else:
+            log(f"未识别代理协议，直接传递代理: {scheme}")
+            sb_kwargs["proxy"] = PROXY
+
     try:
         with SB(**sb_kwargs) as sb:
+            do_login(sb)
+            open_server_overview(sb)
+            main_handle = sb.driver.current_window_handle
+
+            before, before_raw = get_remaining(sb)
+            if before is None:
+                raise RuntimeError("未能解析到剩余时间")
+            result_lines.append(f"🕒 续期前剩余: {before_raw or str(before) + ' 分钟'}")
+
+            current = before
+            for hours in (24, 12):
+                status = run_add_flow(sb, main_handle, hours, current)
+                after, _ = get_remaining(sb)
+                if after is not None:
+                    current = after
+                if status == "credited":
+                    credited_any = True
+                    result_lines.append(f"✅ Add {hours} Hours: 已到账")
+                elif status == "unavailable":
+                    result_lines.append(f"⏳ Add {hours} Hours: 冷却中或不可用")
+                else:
+                    result_lines.append(f"❌ Add {hours} Hours: 失败/未到账")
+
+            final, final_raw = get_remaining(sb)
+            if final is not None:
+                result_lines.append(f"🕒 续期后剩余: {final_raw or str(final) + ' 分钟'}")
+
             try:
-                stage = "login"
-                do_login(sb)
-                stage = "overview"
-                open_server_overview(sb)
-                stage = "renew"
-                main_handle = sb.driver.current_window_handle
-
-                before, before_raw = get_remaining(sb)
-                if before is None:
-                    save_shot(sb, "error_no_remaining")
-                    raise RuntimeError(
-                        "Overview 页未能解析到 Remaining 剩余时间 "
-                        f"(当前页: {sb.get_current_url()})")
-                log(f"续期前剩余时间: {before} 分钟 ({before_raw})")
-                result_lines.append(f"🕒 续期前剩余: {before_raw or str(before) + ' 分钟'}")
-
-                current = before
-                for hours in (24, 12):
-                    status = run_add_flow(sb, main_handle, hours, current)
-                    after, _ = get_remaining(sb)
-                    if after is not None:
-                        current = after
-                    if status == "credited":
-                        credited_any = True
-                        result_lines.append(f"✅ Add {hours} Hours: 已到账")
-                    elif status == "unavailable":
-                        result_lines.append(
-                            f"⏳ Add {hours} Hours: 按钮不可用(冷却中或未找到)")
-                    elif status == "not_credited":
-                        result_lines.append(
-                            f"⚠️ Add {hours} Hours: 流程走完但未确认到账")
-                    else:
-                        result_lines.append(
-                            f"❌ Add {hours} Hours: shrinkme 流程未走完")
-
-                final, final_raw = get_remaining(sb)
-                if final is not None:
-                    result_lines.append(
-                        f"🕒 续期后剩余: {final_raw or str(final) + ' 分钟'}"
-                        f" (净增 {final - before} 分钟)")
-                # 过期服务器加时长后仍是 Stopped, 必须点 Start 才真正上线
-                # (Deborah 指出: 页面有 Start 按钮, 加完时长直接启动)。
-                # 只在剩余 > 0 时尝试; 运行中的服务器 ensure_started 会不动。
-                try:
-                    start_status = ensure_started(sb)
-                    if start_status == "started":
-                        result_lines.append("▶️ 服务器已点 Start 启动")
-                    elif start_status == "already_running":
-                        result_lines.append("▶️ 服务器已在运行, 无需启动")
-                    elif start_status != "no_time":
-                        result_lines.append(f"⚠️ Start 未确认({start_status})")
-                except Exception as e:
-                    log(f"[Start] 启动步骤异常: {e}")
-                save_shot(sb, "final_overview")
+                start_status = ensure_started(sb)
+                result_lines.append(f"▶️ 服务器启动状态: {start_status}")
             except Exception:
-                # 失败时兜底截图, 便于通过 Artifact 排查
-                save_shot(sb, "error_final")
-                raise
+                pass
+
         result_lines.append(f"完成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         send_tg("\n".join(result_lines))
-        log("任务执行完毕")
-        _print_xray_tail()
+        _print_proxy_tail("/tmp/proxy-error.log")
         if not credited_any:
-            # 注意: 这句话只表示“结束时未确认到账”, 不代表 Add 按钮被执行过;
-            # 死在登录/Overview 阶段时 Add 流程根本未开始, 见上方阶段日志。
-            log("结束时未确认任何 Add 到账(若死在登录/Overview 阶段, "
-                "Add 流程根本未开始), 以非 0 退出码结束(便于 Actions 标红排查)")
             sys.exit(2)
-    except SystemExit:
-        raise
     except Exception as e:
-        if stage == "startup":
-            log("启动阶段失败, 浏览器未启动, HOKAS 未产生任何登录或操作")
-        elif stage == "login":
-            log("登录阶段失败, 本次未能进入续期流程(Add 按钮根本没被执行, "
-                "不是续期本身失败)")
-        elif stage == "overview":
-            log("进入服务器 Overview 阶段失败, Add 流程根本没被执行, "
-                "不是续期本身失败")
-        log(f"任务失败: {e}")
-        _print_xray_tail()
+        log(f"执行失败: {e}")
+        _print_proxy_tail("/tmp/proxy-error.log")
         traceback.print_exc()
         result_lines.append(f"❌ 续期失败: {e}")
         send_tg("\n".join(result_lines))
