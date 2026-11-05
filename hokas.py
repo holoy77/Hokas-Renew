@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 hokas.net 免费服务器自动续期脚本
-(直接邮箱 + 密码登入版: 登入页面等待 3 秒后输入账号密码)
+(支持邮箱 + 密码登入: 自动兼容同屏输入与分步输入模式)
 """
 
 import atexit
@@ -25,7 +25,7 @@ from seleniumbase import SB
 
 # ---------------- 配置 ----------------
 EMAIL = (os.environ.get("EMAIL") or "").strip()
-# 优先读取 PASSWORD，若未配置则兼容读取 EMAIL_PASSWORD
+# 优先读取 PASSWORD，未设置时兼容 EMAIL_PASSWORD
 PASSWORD = (os.environ.get("PASSWORD") or os.environ.get("EMAIL_PASSWORD") or "").strip()
 
 TG_BOT_TOKEN = (os.environ.get("TG_BOT_TOKEN") or "").strip()
@@ -412,8 +412,27 @@ def send_tg(text):
 
 
 # ---------------- 表单交互与登录 ----------------
+def dump_inputs(sb):
+    """打印页面所有 input 元素属性，便于排查定位器"""
+    try:
+        info = sb.execute_script(
+            "return Array.from(document.querySelectorAll('input')).map(el => "
+            "({type: el.type, name: el.name, id: el.id, placeholder: el.placeholder, vis: !!(el.offsetWidth || el.offsetHeight)}))")
+        log(f"当前页面 input 清单: {info}")
+    except Exception:
+        pass
+
+
 def find_email_input(sb):
-    for sel in ('input[name="identifier"]', 'input[type="email"]', 'input[id*="identifier"]', 'input[placeholder*="email" i]'):
+    for sel in (
+        'input[name="identifier"]',
+        'input#identifier-field',
+        'input[type="email"]',
+        'input[name="email"]',
+        'input[id*="identifier"]',
+        'input[autocomplete*="username"]',
+        'input[placeholder*="email" i]',
+    ):
         try:
             if sb.is_element_visible(sel):
                 return sel
@@ -423,7 +442,14 @@ def find_email_input(sb):
 
 
 def find_password_input(sb):
-    for sel in ('input[name="password"]', 'input[type="password"]', 'input[id*="password"]', 'input[placeholder*="password" i]'):
+    for sel in (
+        'input[name="password"]',
+        'input#password-field',
+        'input[type="password"]',
+        'input[id*="password"]',
+        'input[autocomplete*="password"]',
+        'input[placeholder*="password" i]',
+    ):
         try:
             if sb.is_element_visible(sel):
                 return sel
@@ -432,60 +458,25 @@ def find_password_input(sb):
     return None
 
 
-def wait_login_form(sb, timeout=30):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        e_sel = find_email_input(sb)
-        p_sel = find_password_input(sb)
-        if e_sel and p_sel:
-            return e_sel, p_sel
-        sb.sleep(1)
-    return None, None
-
-
-def switch_to_sign_in(sb):
-    try:
-        if not (sb.is_text_visible("Create your account") or sb.is_text_visible("Already have an account")):
-            return False
-        for sel in ('//a[normalize-space(text())="Sign in"]', 'a:contains("Sign in")', 'button:contains("Sign in")'):
-            try:
-                if sb.is_element_visible(sel):
-                    sb.click(sel)
-                    sb.sleep(3)
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return False
-
-
-def click_login_entry(sb):
-    if find_email_input(sb):
-        return
-    xpath = ('//a[contains(translate(., "LOGIN", "login"), "login") and not(contains(translate(., "SIGNUP", "signup"), "signup"))] | '
-             '//button[contains(translate(., "LOGIN", "login"), "login") and not(contains(translate(., "SIGNUP", "signup"), "signup"))] | '
-             '//a[contains(translate(., "SIGN", "sign"), "sign in")] | //button[contains(translate(., "SIGN", "sign"), "sign in")]')
-    try:
-        for el in sb.find_elements(xpath, by="xpath"):
-            if el.is_displayed():
-                el.click()
-                sb.sleep(3)
-                return
-    except Exception:
-        pass
-
-
 def click_continue(sb):
-    for sel in ('//button[contains(translate(., "CONTINUE", "continue"), "continue") '
-                'and not(contains(translate(., "GOOGLE", "google"), "google"))]',
-                'form button.cl-formButtonPrimary', 'form button[type="submit"]'):
+    for sel in (
+        '//button[contains(translate(., "CONTINUE", "continue"), "continue") and not(contains(translate(., "GOOGLE", "google"), "google"))]',
+        'form button.cl-formButtonPrimary',
+        'button[data-localization-key="formButtonPrimary"]',
+        'form button[type="submit"]',
+    ):
         try:
             if sb.is_element_visible(sel):
                 sb.click(sel)
                 return True
         except Exception:
             continue
+    # 兜底回车提交
+    try:
+        sb.send_keys('input:focus', "\n")
+        return True
+    except Exception:
+        pass
     return False
 
 
@@ -514,41 +505,96 @@ def do_login(sb):
         log("检测到已处于登录状态")
         return
 
-    click_login_entry(sb)
-    switch_to_sign_in(sb)
-
-    # 查找邮箱和密码输入框
-    email_sel, pass_sel = wait_login_form(sb, 20)
-    if not (email_sel and pass_sel):
-        # 尝试处理 Cloudflare 盾牌
+    # 等待表单渲染 (轮询查找邮箱或密码输入框)
+    log("等待登录表单渲染...")
+    email_sel = None
+    pass_sel = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        email_sel = find_email_input(sb)
+        pass_sel = find_password_input(sb)
+        if email_sel or pass_sel:
+            break
         try:
-            log("未检测到登录表单，尝试处理 Cloudflare 验证...")
             sb.uc_gui_click_captcha()
-            sb.sleep(4)
         except Exception:
             pass
-        email_sel, pass_sel = wait_login_form(sb, 15)
+        sb.sleep(2)
 
-    if not (email_sel and pass_sel):
+    if not email_sel and not pass_sel:
+        dump_inputs(sb)
         save_shot(sb, "error_no_login_form")
         raise RuntimeError(f"未能找到邮箱或密码输入框，当前页面: {sb.get_current_url()}")
 
-    # 输入邮箱与密码
-    log(f"输入邮箱: {EMAIL}")
-    sb.type(email_sel, EMAIL)
-    sb.sleep(1)
+    # 情况 A：同屏同时存在邮箱和密码输入框 (正如网页截图所示)
+    if email_sel and pass_sel:
+        log(f"检测到同屏邮箱与密码表单，输入邮箱: {EMAIL}")
+        sb.type(email_sel, EMAIL)
+        sb.sleep(1)
+        log("输入登录密码...")
+        sb.type(pass_sel, PASSWORD)
+        sb.sleep(1)
+        save_shot(sb, "filled_credentials")
+        log("点击 Continue 提交登录...")
+        click_continue(sb)
+        sb.sleep(5)
 
-    log("输入登录密码...")
-    sb.type(pass_sel, PASSWORD)
-    sb.sleep(1)
+    # 情况 B：仅显示邮箱输入框 (分步登录)
+    elif email_sel and not pass_sel:
+        log(f"检测到邮箱输入框(分步模式)，输入邮箱: {EMAIL}")
+        sb.type(email_sel, EMAIL)
+        sb.sleep(1)
+        save_shot(sb, "filled_email")
+        log("点击 Continue 进入下一步...")
+        click_continue(sb)
+        sb.sleep(4)
 
-    save_shot(sb, "filled_credentials")
+        log("等待密码输入框出现...")
+        p_deadline = time.time() + 20
+        while time.time() < p_deadline:
+            pass_sel = find_password_input(sb)
+            if pass_sel:
+                break
+            # 若默认进了邮箱验证码，检查并点击“使用密码登录 / Use password”
+            for pwd_opt in (
+                '//button[contains(., "password") or contains(., "Password")]',
+                '//a[contains(., "password") or contains(., "Password")]',
+                '//button[contains(., "Use password")]',
+            ):
+                try:
+                    if sb.is_element_visible(pwd_opt):
+                        sb.click(pwd_opt)
+                        sb.sleep(2)
+                        break
+                except Exception:
+                    pass
+            sb.sleep(2)
 
-    log("点击 Continue 提交登录...")
-    click_continue(sb)
-    sb.sleep(5)
+        if not pass_sel:
+            dump_inputs(sb)
+            save_shot(sb, "error_no_password_step2")
+            raise RuntimeError("分步模式未能进入密码输入页")
 
-    # 循环检查是否成功进入控制台面板
+        log("输入登录密码...")
+        sb.type(pass_sel, PASSWORD)
+        sb.sleep(1)
+        save_shot(sb, "filled_password")
+        log("点击 Continue 提交登录...")
+        click_continue(sb)
+        sb.sleep(5)
+
+    # 情况 C：仅显示密码框 (邮箱已被浏览器记住预填)
+    elif pass_sel and not email_sel:
+        log("检测到密码输入框(邮箱已被记住)，输入登录密码...")
+        sb.type(pass_sel, PASSWORD)
+        sb.sleep(1)
+        save_shot(sb, "filled_password_only")
+        log("点击 Continue 提交登录...")
+        click_continue(sb)
+        sb.sleep(5)
+
+    # 等待登录完成进入控制台
+    log("等待进入服务器面板...")
     for _ in range(25):
         if page_has_servers(sb):
             log("登录成功，已进入服务器列表！")
@@ -1002,8 +1048,8 @@ def main():
     result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL}"]
     credited_any = False
 
-    # 配置 SeleniumBase：纯无头模式 (headless=True, xvfb=True)
-    sb_kwargs = dict(uc=True, test=True, locale_code="en", headless=True, xvfb=True)
+    # Linux 下配合 Xvfb 运行真实环境参数，彻底避免被反爬识别为 HeadlessChrome
+    sb_kwargs = dict(uc=True, test=True, locale_code="en", headless=False, xvfb=True)
     log(f"浏览器代理状态: {proxy_label()}")
 
     # 代理转发逻辑：优先 sing-box 转换
