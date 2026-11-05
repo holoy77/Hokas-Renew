@@ -36,10 +36,12 @@ jobs:
       - name: Run renew script
         env:
           EMAIL: ${{ secrets.EMAIL }}
-          # 密码登录（支持新建 PASSWORD 或复用 EMAIL_PASSWORD）
-          PASSWORD: ${{ secrets.PASSWORD || secrets.EMAIL_PASSWORD }}
+          # Hokas 网页登录密码 (优先读取 PASSWORD，若未设置则读取 GMAIL_PASSWORD)
+          PASSWORD: ${{ secrets.PASSWORD || secrets.GMAIL_PASSWORD }}
+          # Gmail 16 位应用专用密码 (专门用于自动连接 IMAP 抓取异地两步验证码)
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          # 首选 Cookie 登录（在 Secrets 新建 COOKIES 变量，填入导出的 JSON 内容）
+          IMAP_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          # 首选 Cookie 登录 (在 Secrets 新建 COOKIES 变量，填入导出的 JSON 文本)
           COOKIES: ${{ secrets.COOKIES }}
           # 代理节点配置 (支持 http, socks5, vless, hysteria2/hy2, trojan, ss)
           PROXY: ${{ secrets.PROXY }}
