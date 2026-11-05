@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 hokas.net 免费服务器自动续期脚本
-(结构参考同账号的 Pella-Renew 项目: Clerk 邮箱验证码登录 + IMAP 取码 + SeleniumBase UC)
+(直接邮箱 + 密码登入版: 登入页面等待 3 秒后输入账号密码)
 """
 
 import atexit
-import email
-import email.utils
-import imaplib
 import json
 import os
 import re
@@ -15,45 +12,35 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import time
 import traceback
 import urllib.parse
 import urllib.request
-import tarfile
 import zipfile
-from datetime import datetime, timezone
-from email.header import decode_header
+from datetime import datetime
 
 import requests
 from seleniumbase import SB
 
 # ---------------- 配置 ----------------
 EMAIL = (os.environ.get("EMAIL") or "").strip()
-EMAIL_PASSWORD = (os.environ.get("EMAIL_PASSWORD") or "").strip()
-IMAP_SERVER = (os.environ.get("IMAP_SERVER") or "imap.gmail.com").strip()
-IMAP_PORT = int(os.environ.get("IMAP_PORT") or "993")
+# 优先读取 PASSWORD，若未配置则兼容读取 EMAIL_PASSWORD
+PASSWORD = (os.environ.get("PASSWORD") or os.environ.get("EMAIL_PASSWORD") or "").strip()
+
 TG_BOT_TOKEN = (os.environ.get("TG_BOT_TOKEN") or "").strip()
 TG_CHAT_ID = (os.environ.get("TG_CHAT_ID") or "").strip()
 PANEL_URL = (os.environ.get("PANEL_URL") or "https://hokas.net").strip().rstrip("/")
 SIGN_IN_URL = (os.environ.get("SIGN_IN_URL") or "https://hokas.net/sign-in").strip()
 SERVER_NAME = (os.environ.get("SERVER_NAME") or "").strip()
 SERVER_ID = (os.environ.get("SERVER_ID") or "").strip()
-GMAIL_PASSWORD = (os.environ.get("GMAIL_PASSWORD") or EMAIL_PASSWORD).strip()
-CODE_SOURCE = (os.environ.get("CODE_SOURCE") or "auto").strip().lower()
+
+# 代理配置 (支持 http, socks5, vless, hysteria2/hy2, trojan, ss)
 PROXY = (os.environ.get("PROXY") or "").strip()
-# 可通过环境变量切换本地内核后端: "sing-box" 或 "xray" (默认优先使用 sing-box)
 PROXY_CORE = (os.environ.get("PROXY_CORE") or "sing-box").strip().lower()
 
 SHOT_DIR = os.path.join(os.getcwd(), "screenshots")
 _shot_counter = [0]
-
-CODE_MAX_RETRIES = 6
-CODE_POLL_INTERVAL = 10
-
-GMAIL_URL = "https://mail.google.com/mail/u/0/#inbox"
-GMAIL_SIGNIN_URL = ("https://accounts.google.com/ServiceLogin?service=mail"
-                    "&continue=https%3A%2F%2Fmail.google.com%2Fmail%2Fu%2F0%2F")
-CODE_SUBJECT_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)\s+is your verification code", re.I)
 
 
 def log(msg):
@@ -424,357 +411,7 @@ def send_tg(text):
         log(f"TG 通知异常: {e}")
 
 
-# ---------------- 邮箱验证码获取 ----------------
-def _decode(value):
-    if not value:
-        return ""
-    parts = decode_header(value)
-    out = ""
-    for data, charset in parts:
-        if isinstance(data, bytes):
-            out += data.decode(charset or "utf-8", errors="ignore")
-        else:
-            out += data
-    return out
-
-
-def _mail_body(msg):
-    texts = []
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype in ("text/plain", "text/html"):
-                payload = part.get_payload(decode=True)
-                if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    texts.append(payload.decode(charset, errors="ignore"))
-    else:
-        payload = msg.get_payload(decode=True)
-        if payload:
-            charset = msg.get_content_charset() or "utf-8"
-            texts.append(payload.decode(charset, errors="ignore"))
-    return "\n".join(texts)
-
-
-def _mail_matches(sender, subject):
-    s = subject.lower()
-    return ("hokas" in sender or "clerk" in sender or "hokas" in s
-            or "verification code" in s or "verify" in s)
-
-
-def _scan_folder(box, folder, after_ts, diag_lines):
-    status, _ = box.select(folder, readonly=True)
-    if status != "OK":
-        return None
-    since = datetime.now(timezone.utc).strftime("%d-%b-%Y")
-    status, data = box.search(None, f'(SINCE "{since}")')
-    if status != "OK":
-        return None
-    ids = data[0].split()
-    for mail_id in reversed(ids[-20:]):
-        status, msg_data = box.fetch(mail_id, "(RFC822)")
-        if status != "OK":
-            continue
-        msg = email.message_from_bytes(msg_data[0][1])
-        subject = _decode(msg.get("Subject", ""))
-        sender = _decode(msg.get("From", "")).lower()
-        date_hdr = msg.get("Date", "")
-        if diag_lines is not None and len(diag_lines) < 10:
-            diag_lines.append(f"  [{folder}] {date_hdr} | {sender} | {subject}")
-        if not _mail_matches(sender, subject):
-            continue
-        if date_hdr:
-            try:
-                mail_ts = email.utils.parsedate_to_datetime(date_hdr).timestamp()
-                if mail_ts < after_ts - 120:
-                    continue
-            except Exception:
-                pass
-        content = subject + "\n" + _mail_body(msg)
-        m = re.search(r"(?<!\d)(\d{6})(?!\d)", content)
-        if m:
-            log(f"从[{folder}]邮件[{subject}]中提取到验证码: {m.group(1)}")
-            return m.group(1)
-    return None
-
-
-def fetch_verification_code(after_ts):
-    last_err = None
-    folders = ["INBOX"]
-    if "gmail" in IMAP_SERVER:
-        folders += ['"[Gmail]/Spam"', '"[Gmail]/All Mail"']
-    for attempt in range(1, CODE_MAX_RETRIES + 1):
-        log(f"第 {attempt}/{CODE_MAX_RETRIES} 次尝试读取验证码邮件...")
-        try:
-            box = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-            imap_password = (EMAIL_PASSWORD.replace(" ", "")
-                             if "gmail" in IMAP_SERVER else EMAIL_PASSWORD)
-            box.login(EMAIL, imap_password)
-            diag_lines = [] if attempt == 1 else None
-            code = None
-            for folder in folders:
-                try:
-                    code = _scan_folder(box, folder, after_ts, diag_lines)
-                except Exception as fe:
-                    log(f"扫描文件夹 {folder} 异常: {fe}")
-                if code:
-                    break
-            if diag_lines is not None:
-                log("最近邮件清单(用于排查):\n" + ("\n".join(diag_lines) or "  (今天没有任何邮件)"))
-            box.logout()
-            if code:
-                return code
-        except Exception as e:
-            last_err = e
-            log(f"读取邮箱异常: {e}")
-            if "AUTHENTICATIONFAILED" in str(e).upper() or "Invalid credentials" in str(e):
-                raise RuntimeError(f"IMAP 认证失败, 请检查 EMAIL_PASSWORD 是否为有效的应用专用密码: {e}")
-        if attempt < CODE_MAX_RETRIES:
-            log(f"尚未收到验证码邮件, {CODE_POLL_INTERVAL} 秒后重试...")
-            time.sleep(CODE_POLL_INTERVAL)
-    suffix = f" (最后一次异常: {last_err})" if last_err else ""
-    raise TimeoutError(f"尝试 {CODE_MAX_RETRIES} 次仍未收到验证码邮件, 停止重试{suffix}")
-
-
-def gmail_login(sb):
-    if not GMAIL_PASSWORD:
-        log("未配置 GMAIL_PASSWORD(网页登录密码), 跳过 Gmail 网页登录")
-        return None
-    password = GMAIL_PASSWORD
-    main_tab = sb.driver.current_window_handle
-    gmail_tab = None
-    try:
-        sb.driver.switch_to.new_window("tab")
-        gmail_tab = sb.driver.current_window_handle
-        log("新标签页打开 Gmail 登录页...")
-        sb.open(GMAIL_SIGNIN_URL)
-        sb.sleep(6)
-
-        if gmail_in_inbox(sb):
-            log("Gmail 已处于登录状态")
-            sb.driver.switch_to.window(main_tab)
-            return gmail_tab
-
-        if not sb.is_element_visible('input[type="email"]'):
-            for sel in ('a:contains("Sign in")', '//a[contains(translate(., "SIGN IN", "sign in"), "sign in")]'):
-                try:
-                    if sb.is_element_visible(sel):
-                        sb.click(sel)
-                        sb.sleep(6)
-                        break
-                except Exception:
-                    continue
-
-        if sb.is_element_visible('input[type="email"]'):
-            sb.type('input[type="email"]', EMAIL)
-            gmail_click_next(sb)
-            sb.sleep(6)
-
-        for _ in range(8):
-            if sb.is_element_visible('input[type="password"]'):
-                break
-            sb.sleep(2)
-        if not sb.is_element_visible('input[type="password"]'):
-            raise RuntimeError("Gmail 登录未出现密码输入框(可能被风控拦截)")
-        sb.type('input[type="password"]', password)
-        gmail_click_next(sb)
-        sb.sleep(8)
-
-        for tip in ("couldn't sign you in", "This browser or app may not be secure", "Verify it’s you", "2-Step Verification"):
-            try:
-                if sb.is_text_visible(tip):
-                    raise RuntimeError(f"Gmail 网页登录被 Google 风控拦截: {tip}")
-            except RuntimeError:
-                raise
-            except Exception:
-                continue
-
-        for _ in range(10):
-            if gmail_in_inbox(sb):
-                sb.driver.switch_to.window(main_tab)
-                return gmail_tab
-            sb.sleep(3)
-        raise RuntimeError("Gmail 登录后未能进入收件箱")
-    except Exception as e:
-        log(f"Gmail 网页登录失败: {e}")
-        try:
-            if gmail_tab:
-                sb.driver.switch_to.window(gmail_tab)
-                sb.driver.close()
-            sb.driver.switch_to.window(main_tab)
-        except Exception:
-            pass
-        return None
-
-
-def gmail_click_next(sb):
-    for sel in ("#identifierNext", "#passwordNext", '//button[contains(., "Next")]', '//span[text()="Next"]/ancestor::button[1]'):
-        try:
-            if sb.is_element_visible(sel):
-                sb.click(sel)
-                return True
-        except Exception:
-            continue
-    try:
-        sb.send_keys('input:focus', "\n")
-        return True
-    except Exception:
-        return False
-
-
-def gmail_in_inbox(sb):
-    try:
-        return ("mail.google.com" in sb.get_current_url() and (sb.is_element_present('div[role="main"]') or sb.is_text_visible("Inbox")))
-    except Exception:
-        return False
-
-
-def gmail_newest_code(sb):
-    try:
-        txt = sb.get_text('div[role="main"]') if sb.is_element_present('div[role="main"]') else sb.get_text("body")
-    except Exception:
-        return None
-    m = CODE_SUBJECT_RE.search(txt or "")
-    return m.group(1) if m else None
-
-
-def gmail_wait_new_code(sb, gmail_tab, baseline):
-    main_tab = sb.driver.current_window_handle
-    code = None
-    try:
-        for attempt in range(1, CODE_MAX_RETRIES + 1):
-            sb.driver.switch_to.window(gmail_tab)
-            try:
-                sb.refresh()
-                sb.sleep(6)
-            except Exception:
-                pass
-            newest = gmail_newest_code(sb)
-            if newest and newest != baseline:
-                log(f"从 Gmail 网页获取到新验证码: {newest}")
-                code = newest
-                break
-            sb.sleep(CODE_POLL_INTERVAL)
-    finally:
-        try:
-            sb.driver.switch_to.window(main_tab)
-        except Exception:
-            pass
-    if not code:
-        raise TimeoutError(f"尝试 {CODE_MAX_RETRIES} 次仍未从 Gmail 网页读到新验证码")
-    return code
-
-
-# ---------------- 输入框与表单交互 ----------------
-def dump_inputs(sb):
-    try:
-        info = sb.execute_script(
-            "return Array.from(document.querySelectorAll('input')).map(el => "
-            "({type: el.type, name: el.name, id: el.id, auto: el.autocomplete, "
-            "mode: el.inputMode, max: el.maxLength, ph: el.placeholder, vis: !!(el.offsetWidth || el.offsetHeight)}))")
-        log(f"页面 input 清单: {info}")
-    except Exception:
-        pass
-
-
-def find_otp_inputs(sb, timeout=40):
-    selectors = (
-        'input[data-otp-input]', 'input[autocomplete="one-time-code"]',
-        'input[name^="codeInput"]', 'input[inputmode="numeric"]',
-        'input[maxlength="1"]', 'input[name="code"]', 'input[id*="code"]',
-        'input[id*="otp"]', 'input[data-testid*="otp"]', 'input[data-testid*="code"]'
-    )
-    deadline = time.time() + timeout
-    while True:
-        for sel in selectors:
-            try:
-                els = [e for e in sb.find_elements(sel) if e.is_displayed()]
-                if els:
-                    return els
-            except Exception:
-                continue
-        try:
-            all_inputs = [e for e in sb.find_elements("input") if e.is_displayed()]
-            singles = [e for e in all_inputs if e.get_attribute("maxlength") == "1" or (e.get_attribute("inputmode") or "").lower() == "numeric"]
-            if len(singles) >= 6 or len(singles) == 1:
-                return singles
-        except Exception:
-            pass
-        if time.time() >= deadline:
-            return []
-        sb.sleep(2)
-
-
-def js_fill_code(sb, code):
-    if not (isinstance(code, str) and code.isdigit() and len(code) == 6):
-        return 0, ""
-    script = """
-    function setVal(el, v) {
-        const setter = Object.getOwnPropertyDescriptor(
-            window.HTMLInputElement.prototype, 'value').set;
-        setter.call(el, v);
-        el.dispatchEvent(new Event('input', {bubbles: true}));
-        el.dispatchEvent(new Event('change', {bubbles: true}));
-    }
-    const code = "%s";
-    const inputs = Array.from(document.querySelectorAll('input'));
-    const otp = inputs.filter(el =>
-        el.autocomplete === 'one-time-code' || el.inputMode === 'numeric' ||
-        /code|otp/i.test(el.name || '') || /code|otp/i.test(el.id || ''));
-    if (otp.length === 1) {
-        setVal(otp[0], code);
-        return {n: 1, val: otp[0].value};
-    }
-    if (otp.length >= 6) {
-        otp.slice(0, 6).forEach((el, i) => setVal(el, code[i]));
-        return {n: 6, val: otp.slice(0, 6).map(el => el.value).join('')};
-    }
-    return {n: 0, val: ''};
-    """ % code
-    try:
-        res = sb.execute_script(script)
-        if isinstance(res, dict):
-            return int(res.get("n") or 0), (res.get("val") or "")
-        return 0, ""
-    except Exception:
-        return 0, ""
-
-
-def fill_code(sb, code):
-    n, val = js_fill_code(sb, code)
-    if n > 0 and val == code:
-        log(f"JS 填码成功: {val}")
-        save_shot(sb, "code_filled")
-        return
-    els = find_otp_inputs(sb, timeout=40)
-    if not els:
-        dump_inputs(sb)
-        save_shot(sb, "error_no_otp_input")
-        raise RuntimeError(f"未找到验证码输入框: {sb.get_current_url()}")
-    try:
-        els[0].click()
-        for ch in code:
-            els[0].send_keys(ch)
-            sb.sleep(0.3)
-    except Exception:
-        pass
-    sb.sleep(1)
-    save_shot(sb, "code_filled")
-
-
-def click_continue(sb):
-    for sel in ('//button[contains(translate(., "CONTINUE", "continue"), "continue") '
-                'and not(contains(translate(., "GOOGLE", "google"), "google"))]',
-                'form button.cl-formButtonPrimary', 'form button[type="submit"]'):
-        try:
-            if sb.is_element_visible(sel):
-                sb.click(sel)
-                return True
-        except Exception:
-            continue
-    return False
-
-
+# ---------------- 表单交互与登录 ----------------
 def find_email_input(sb):
     for sel in ('input[name="identifier"]', 'input[type="email"]', 'input[id*="identifier"]', 'input[placeholder*="email" i]'):
         try:
@@ -785,14 +422,25 @@ def find_email_input(sb):
     return None
 
 
-def wait_email_input(sb, timeout):
+def find_password_input(sb):
+    for sel in ('input[name="password"]', 'input[type="password"]', 'input[id*="password"]', 'input[placeholder*="password" i]'):
+        try:
+            if sb.is_element_visible(sel):
+                return sel
+        except Exception:
+            continue
+    return None
+
+
+def wait_login_form(sb, timeout=30):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        sel = find_email_input(sb)
-        if sel:
-            return sel
-        sb.sleep(2)
-    return None
+        e_sel = find_email_input(sb)
+        p_sel = find_password_input(sb)
+        if e_sel and p_sel:
+            return e_sel, p_sel
+        sb.sleep(1)
+    return None, None
 
 
 def switch_to_sign_in(sb):
@@ -803,7 +451,7 @@ def switch_to_sign_in(sb):
             try:
                 if sb.is_element_visible(sel):
                     sb.click(sel)
-                    sb.sleep(4)
+                    sb.sleep(3)
                     return True
             except Exception:
                 continue
@@ -822,29 +470,23 @@ def click_login_entry(sb):
         for el in sb.find_elements(xpath, by="xpath"):
             if el.is_displayed():
                 el.click()
-                sb.sleep(5)
+                sb.sleep(3)
                 return
     except Exception:
         pass
 
 
-def get_code(sb, request_ts, gmail_tab, baseline):
-    imap_err = None
-    if CODE_SOURCE != "web" and EMAIL_PASSWORD:
+def click_continue(sb):
+    for sel in ('//button[contains(translate(., "CONTINUE", "continue"), "continue") '
+                'and not(contains(translate(., "GOOGLE", "google"), "google"))]',
+                'form button.cl-formButtonPrimary', 'form button[type="submit"]'):
         try:
-            return fetch_verification_code(request_ts)
-        except Exception as e:
-            imap_err = e
-            log(f"IMAP 取码失败: {e}")
-            if CODE_SOURCE == "imap":
-                raise
-    if not GMAIL_PASSWORD and CODE_SOURCE != "web":
-        raise RuntimeError(f"IMAP 取码失败且未配置 GMAIL_PASSWORD: {imap_err}")
-    if gmail_tab is None:
-        gmail_tab = gmail_login(sb)
-    if gmail_tab is None:
-        raise RuntimeError(f"IMAP 与网页均无法获取验证码 (IMAP 错误: {imap_err})")
-    return gmail_wait_new_code(sb, gmail_tab, baseline)
+            if sb.is_element_visible(sel):
+                sb.click(sel)
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def page_has_servers(sb):
@@ -862,7 +504,10 @@ def page_has_servers(sb):
 def do_login(sb):
     log(f"打开登录页: {SIGN_IN_URL}")
     sb.uc_open_with_reconnect(SIGN_IN_URL, reconnect_time=6)
-    sb.sleep(5)
+
+    # 按照需求：登入页面等待 3 秒
+    log("登入页面等待 3 秒...")
+    sb.sleep(3)
     save_shot(sb, "open_signin")
 
     if page_has_servers(sb):
@@ -872,80 +517,47 @@ def do_login(sb):
     click_login_entry(sb)
     switch_to_sign_in(sb)
 
-    email_input = wait_email_input(sb, 30)
-    if not email_input:
+    # 查找邮箱和密码输入框
+    email_sel, pass_sel = wait_login_form(sb, 20)
+    if not (email_sel and pass_sel):
+        # 尝试处理 Cloudflare 盾牌
         try:
+            log("未检测到登录表单，尝试处理 Cloudflare 验证...")
             sb.uc_gui_click_captcha()
-            sb.sleep(5)
+            sb.sleep(4)
         except Exception:
             pass
-        email_input = wait_email_input(sb, 15)
+        email_sel, pass_sel = wait_login_form(sb, 15)
 
-    if not email_input:
-        sb.uc_open_with_reconnect(PANEL_URL, reconnect_time=6)
-        sb.sleep(5)
-        if page_has_servers(sb):
-            return
-        click_login_entry(sb)
-        switch_to_sign_in(sb)
-        email_input = wait_email_input(sb, 15)
+    if not (email_sel and pass_sel):
+        save_shot(sb, "error_no_login_form")
+        raise RuntimeError(f"未能找到邮箱或密码输入框，当前页面: {sb.get_current_url()}")
 
-    if not email_input:
-        save_shot(sb, "error_no_email_input")
-        raise RuntimeError(f"未找到邮箱输入框: {sb.get_current_url()}")
+    # 输入邮箱与密码
+    log(f"输入邮箱: {EMAIL}")
+    sb.type(email_sel, EMAIL)
+    sb.sleep(1)
 
-    if switch_to_sign_in(sb):
-        email_input = wait_email_input(sb, 15) or email_input
-    sb.type(email_input, EMAIL)
+    log("输入登录密码...")
+    sb.type(pass_sel, PASSWORD)
+    sb.sleep(1)
 
-    gmail_tab, baseline = None, None
-    if CODE_SOURCE == "web":
-        gmail_tab = gmail_login(sb)
-        if gmail_tab:
-            main_tab = sb.driver.current_window_handle
-            try:
-                sb.driver.switch_to.window(gmail_tab)
-                baseline = gmail_newest_code(sb)
-            except Exception:
-                pass
-            finally:
-                sb.driver.switch_to.window(main_tab)
+    save_shot(sb, "filled_credentials")
 
-    request_ts = time.time()
+    log("点击 Continue 提交登录...")
     click_continue(sb)
     sb.sleep(5)
 
-    if "accounts.google.com" in sb.get_current_url():
-        sb.uc_open_with_reconnect(SIGN_IN_URL, reconnect_time=6)
-        sb.sleep(5)
-        switch_to_sign_in(sb)
-        email_input = wait_email_input(sb, 20)
-        sb.type(email_input, EMAIL)
-        request_ts = time.time()
-        click_continue(sb)
-        sb.sleep(5)
-
-    for _ in range(10):
-        try:
-            if (sb.is_text_visible("Check your email") or "factor-one" in sb.get_current_url() or find_otp_inputs(sb)):
-                break
-        except Exception:
-            pass
-        sb.sleep(2)
-
-    code = get_code(sb, request_ts, gmail_tab, baseline)
-    fill_code(sb, code)
-    click_continue(sb)
-    sb.sleep(5)
-
-    for _ in range(20):
+    # 循环检查是否成功进入控制台面板
+    for _ in range(25):
         if page_has_servers(sb):
-            log("登录成功进入面板")
+            log("登录成功，已进入服务器列表！")
             save_shot(sb, "logged_in")
             return
         sb.sleep(2)
-    save_shot(sb, "error_after_code")
-    raise RuntimeError("登录后未能进入服务器列表页")
+
+    save_shot(sb, "error_login_timeout")
+    raise RuntimeError("登录提交后未能进入服务器面板，请查看截图")
 
 
 # ---------------- 业务与续期 ----------------
@@ -1383,17 +995,18 @@ def main():
     if not EMAIL:
         log("错误: 必须配置 EMAIL 环境变量")
         sys.exit(1)
-    if not EMAIL_PASSWORD and not GMAIL_PASSWORD:
-        log("错误: 必须配置 EMAIL_PASSWORD 或 GMAIL_PASSWORD")
+    if not PASSWORD:
+        log("错误: 必须配置 PASSWORD (或 EMAIL_PASSWORD) 登录密码环境变量")
         sys.exit(1)
 
     result_lines = ["🖥️ <b>Hokas 自动续期报告</b>", f"账号: {EMAIL}"]
     credited_any = False
 
-    sb_kwargs = dict(uc=True, test=True, locale_code="en", headless=False, xvfb=True)
+    # 配置 SeleniumBase：纯无头模式 (headless=True, xvfb=True)
+    sb_kwargs = dict(uc=True, test=True, locale_code="en", headless=True, xvfb=True)
     log(f"浏览器代理状态: {proxy_label()}")
 
-    # 代理转发逻辑：sing-box 优先或备用 Xray
+    # 代理转发逻辑：优先 sing-box 转换
     if PROXY:
         scheme = PROXY.split("://", 1)[0].lower() if "://" in PROXY else ""
         if scheme in ("vless", "hysteria2", "hy2", "trojan", "ss"):
